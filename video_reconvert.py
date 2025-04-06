@@ -12,12 +12,15 @@ import glob
 import select
 from pathlib import Path
 from datetime import datetime
-from rich.console import Console
+from rich.console import Console, Group
 from rich.progress import Progress, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn
 from rich.logging import RichHandler
 from rich.panel import Panel
 from rich.table import Table
+from rich.layout import Layout
+from rich.live import Live
 from rich import print as rprint
+from rich.prompt import Prompt
 from logging.handlers import RotatingFileHandler
 import config
 import video_utils
@@ -25,7 +28,196 @@ import video_utils
 # Global variables for cleanup
 current_temp_file = None
 exit_requested = False
-console = Console()
+
+class VideoReconvertUI:
+    def __init__(self):
+        self.layout = Layout()
+        
+        # Split into header and body
+        self.layout.split_column(
+            Layout(name="header", size=3),
+            Layout(name="body")
+        )
+        
+        # Split body into left and right columns
+        self.layout["body"].split_row(
+            Layout(name="left_panel", ratio=1),
+            Layout(name="logs", ratio=1)
+        )
+        
+        # Split left panel into global stats and details
+        self.layout["left_panel"].split_column(
+            Layout(name="global_stats", size=8),  # Fixed size for global stats
+            Layout(name="details")  # Takes remaining space
+        )
+        
+        # Create separate consoles
+        self.dashboard_console = Console(force_terminal=True)
+        self.log_console = Console(force_terminal=True)
+        
+        # Initialize the live display
+        self.live = Live(self.layout, refresh_per_second=4, console=Console())
+        
+        # Keep track of log messages
+        self.log_messages = []
+        
+        # Progress bar for individual file progress
+        self.progress = Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeRemainingColumn(),
+        )
+        self.current_task = None
+        
+        # Keep track of current content
+        self.summary_table = None
+        self.detail_content = None
+        
+    def start(self):
+        """Start the live display"""
+        self.live.start()
+        self.update_header("Video Reconvert")
+        self.progress.start()
+        
+    def stop(self):
+        """Stop the live display"""
+        if self.current_task is not None:
+            self.stop_progress()
+        self.progress.stop()
+        self.live.stop()
+        
+    def update_header(self, text):
+        """Update the header section"""
+        self.layout["header"].update(
+            Panel(text, style=config.UI['header_style'])
+        )
+        
+    def update_dashboard(self, content):
+        """Update the dashboard section with both summary and detail content"""
+        if isinstance(content, Table):
+            # Check if this is a global stats table
+            if hasattr(content, 'is_global_stats'):
+                self.summary_table = content
+                # Update global stats panel
+                self.layout["global_stats"].update(
+                    Panel(
+                        self.summary_table,
+                        title="Global Progress",
+                        border_style=config.UI['header_style']
+                    )
+                )
+            else:
+                # This is a detail table
+                self.detail_content = content
+                self._update_details_panel()
+        elif content is not None:
+            # This is other detail content
+            self.detail_content = content
+            self._update_details_panel()
+        
+    def _update_details_panel(self):
+        """Update the details panel with current content and progress"""
+        detail_content = []
+        
+        # Add detail content
+        if self.detail_content:
+            detail_content.append(self.detail_content)
+        
+        # Add progress bar at the bottom if active
+        if self.current_task is not None:
+            if detail_content:
+                detail_content.append("")  # Add spacing
+            detail_content.append(self.progress)
+        
+        # Update details panel
+        self.layout["details"].update(
+            Panel(
+                Group(*detail_content) if detail_content else "",
+                title="Video Details",
+                border_style=config.UI['header_style']
+            )
+        )
+        
+    def start_progress(self, description):
+        """Start a new progress bar"""
+        self.current_task = self.progress.add_task(description, total=1.0)
+        # Don't clear content when starting progress
+        self.update_dashboard(self.detail_content)
+        
+    def update_progress(self, value):
+        """Update the progress bar"""
+        if self.current_task is not None:
+            self.progress.update(self.current_task, completed=value)
+            
+    def stop_progress(self):
+        """Stop the current progress bar"""
+        if self.current_task is not None:
+            self.progress.remove_task(self.current_task)
+            self.current_task = None
+            # Preserve current content when stopping progress
+            self.update_dashboard(self.detail_content)
+        
+    def add_log(self, message):
+        """Add a log message to the log section"""
+        self.log_messages.append(message)
+        # Keep only the last 100 messages to prevent memory issues
+        if len(self.log_messages) > 100:
+            self.log_messages.pop(0)
+        self.update_logs()
+        
+    def update_logs(self):
+        """Update the log section with current messages"""
+        # Format log messages with timestamp and level
+        formatted_messages = []
+        for msg in self.log_messages[-30:]:  # Show last 30 messages
+            try:
+                # Extract timestamp and level if present
+                parts = msg.split(' - ', 3)
+                if len(parts) >= 3:
+                    timestamp, logger, level, message = parts
+                    level_style = {
+                        'ERROR': config.UI['error_style'],
+                        'WARNING': config.UI['warning_style'],
+                        'INFO': config.UI['info_style'],
+                        'DEBUG': 'dim white'
+                    }.get(level, '')
+                    
+                    formatted_msg = f"[dim]{timestamp}[/dim] [{level_style}]{level:8}[/{level_style}] {message}"
+                    formatted_messages.append(formatted_msg)
+                else:
+                    formatted_messages.append(msg)
+            except Exception:
+                # If parsing fails, just show the original message
+                formatted_messages.append(msg)
+                
+        log_content = "\n".join(formatted_messages)
+        self.layout["logs"].update(
+            Panel(log_content, title="Log Output", border_style=config.UI['info_style'])
+        )
+        
+    def prompt(self, message):
+        """Show a prompt to the user"""
+        self.live.stop()
+        result = Prompt.ask(message)
+        self.live.start()
+        return result
+
+# Create global UI instance
+ui = VideoReconvertUI()
+
+# Custom Rich handler that updates our UI
+class UIRichHandler(RichHandler):
+    def emit(self, record):
+        try:
+            # Format the message with timestamp and level
+            msg = self.format(record)
+            # Add to our UI's log section
+            ui.add_log(msg)
+        except Exception as e:
+            # Fallback to standard output if UI fails
+            print(f"Log handler error: {e}")
+            print(f"Original message: {record.getMessage()}")
 
 # Configure logging
 log_level = getattr(logging, config.LOGGING['level'])
@@ -41,7 +233,15 @@ file_handler.setFormatter(log_formatter)
 file_handler.setLevel(logging.DEBUG)  # Always capture debug in file
 
 # Console handler with rich formatting - use configured level
-console_handler = RichHandler(rich_tracebacks=True)
+console_handler = UIRichHandler(
+    rich_tracebacks=True,
+    console=ui.log_console,
+    show_time=True,
+    show_level=True,
+    show_path=False,
+    enable_link_path=False
+)
+console_handler.setFormatter(log_formatter)
 console_handler.setLevel(log_level)  # Use configured level for console
 
 # Set root logger to DEBUG to allow everything through
@@ -585,7 +785,7 @@ def format_size(size_bytes):
         size_bytes /= 1024
     return f"{size_bytes:.2f} {unit}"
 
-def display_status(conn, console):
+def display_status(conn):
     """Display status information in the console."""
     summary = get_status_summary(conn)
     
@@ -610,18 +810,20 @@ def display_status(conn, console):
     if summary['completed_count'] > 0:
         table.add_row("Space Saved", f"[{config.UI['header_style']}]{format_size(summary['space_saved'])} ({summary['percent_saved']:.1f}%)[/{config.UI['header_style']}]")
     
-    console.print(Panel(table, title="Video Reconvert Status", border_style=config.UI['header_style']))
+    # Mark this table as a global stats table
+    setattr(table, 'is_global_stats', True)
+    ui.update_dashboard(table)
 
-def analyze_video(video_path, console):
+def analyze_video(video_path):
     """Display detailed analysis for a single video."""
     # Check if the file exists
     if not os.path.exists(video_path):
-        console.print(f"[{config.UI['error_style']}]Cannot analyze: File does not exist: {video_path}[/{config.UI['error_style']}]")
+        log.error(f"Cannot analyze: File does not exist: {video_path}")
         return
         
     video_info = get_video_info(video_path)
     if not video_info:
-        console.print(f"[{config.UI['error_style']}]Failed to analyze video: {video_path}[/{config.UI['error_style']}]")
+        log.error(f"Failed to analyze video: {video_path}")
         return
     
     # Run sanity checks
@@ -630,9 +832,11 @@ def analyze_video(video_path, console):
     # Get analysis and recommendations
     analysis = video_utils.analyze_conversion_potential(video_info)
     
-    # Display basic info
-    console.print(Panel(f"[bold]Video Analysis:[/bold] {os.path.basename(video_path)}", 
-                        style=config.UI['header_style']))
+    # Create tables for display
+    tables = []
+    
+    # Basic info header
+    tables.append(f"[bold]Video Analysis:[/bold] {os.path.basename(video_path)}")
     
     # Original video properties
     props_table = Table(show_header=False)
@@ -647,7 +851,7 @@ def analyze_video(video_path, console):
     if video_info.get('audio'):
         props_table.add_row("Audio", f"{video_info['audio']['codec']} ({video_info['audio']['channels']} ch, {video_info['audio']['sample_rate']} Hz)")
     
-    console.print(props_table)
+    tables.append(props_table)
     
     # Display issues
     if issues:
@@ -669,7 +873,7 @@ def analyze_video(video_path, console):
                 issue['details']
             )
         
-        console.print(issues_table)
+        tables.append(issues_table)
     
     # Display recommendations
     if 'recommendations' in analysis:
@@ -680,7 +884,7 @@ def analyze_video(video_path, console):
         for key, value in analysis['recommendations'].items():
             rec_table.add_row(key, str(value))
         
-        console.print(rec_table)
+        tables.append(rec_table)
     
     # Display estimated savings
     if 'estimated_savings' in analysis:
@@ -693,174 +897,161 @@ def analyze_video(video_path, console):
         savings_table.add_row("Space Saved", format_size(est['estimated_saving_mb'] * 1024 * 1024))
         savings_table.add_row("Saving Percentage", f"{est['estimated_saving_pct']:.1f}%")
         
-        console.print(savings_table)
+        tables.append(savings_table)
+    
+    # Update dashboard with all tables
+    ui.update_dashboard(Group(*tables))
 
 def process_videos(source_path, analyze_only=False, target_video=None):
     """Main function to process all videos."""
     global current_temp_file
     
-    # Check if ffmpeg is available
-    if not video_utils.check_ffmpeg_availability():
-        console.print(f"[{config.UI['error_style']}]Error: ffmpeg and ffprobe are required but not found.[/{config.UI['error_style']}]")
-        console.print("Please install ffmpeg and make sure it's in your PATH.")
-        return
+    # Start the UI
+    ui.start()
     
-    # Check for temp files from previous interrupted runs
-    if source_path:
-        temp_files = find_temp_files(source_path)
-        if temp_files:
-            console.print(f"[{config.UI['warning_style']}]Found {len(temp_files)} temporary files from previous interrupted runs:[/{config.UI['warning_style']}]")
-            for tf in temp_files:
-                console.print(f"  - {tf}")
-            
-            response = console.input(f"[{config.UI['info_style']}]Would you like to delete these temporary files? (y/n): [/{config.UI['info_style']}]")
-            if response.lower() in ('y', 'yes'):
-                clean_temp_files(temp_files)
-                console.print(f"[{config.UI['header_style']}]Temporary files cleaned up.[/{config.UI['header_style']}]")
+    try:
+        # Check if ffmpeg is available
+        if not video_utils.check_ffmpeg_availability():
+            log.error("Error: ffmpeg and ffprobe are required but not found.")
+            log.error("Please install ffmpeg and make sure it's in your PATH.")
+            return
+        
+        # Check for temp files from previous interrupted runs
+        if source_path:
+            temp_files = find_temp_files(source_path)
+            if temp_files:
+                log.warning(f"Found {len(temp_files)} temporary files from previous interrupted runs:")
+                for tf in temp_files:
+                    log.info(f"  - {tf}")
+                
+                response = ui.prompt("Would you like to delete these temporary files? (y/n): ")
+                if response.lower() in ('y', 'yes'):
+                    clean_temp_files(temp_files)
+                    log.info("Temporary files cleaned up.")
+                else:
+                    log.info("Temporary files will be ignored during processing.")
+        
+        conn = setup_database()
+        
+        # If target video is specified, only analyze that one
+        if target_video:
+            if os.path.exists(target_video):
+                analyze_video(target_video)
             else:
-                console.print(f"[{config.UI['info_style']}]Temporary files will be ignored during processing.[/{config.UI['info_style']}]")
+                log.error(f"Error: Video file not found: {target_video}")
+            return
         
-    conn = setup_database()
-    
-    # If target video is specified, only analyze that one
-    if target_video:
-        if os.path.exists(target_video):
-            analyze_video(target_video, console)
-        else:
-            console.print(f"[{config.UI['error_style']}]Error: Video file not found: {target_video}[/{config.UI['error_style']}]")
-        return
-    
-    # Find all videos in source path
-    log.info(f"Scanning for videos in {source_path}")
-    videos = find_videos(source_path)
-    log.info(f"Found {len(videos)} video files")
-    
-    # Clean up database - mark files that no longer exist as 'missing'
-    if source_path:
+        # Find all videos in source path
+        log.info(f"Scanning for videos in {source_path}")
+        videos = find_videos(source_path)
+        log.info(f"Found {len(videos)} video files")
+        
+        # Clean up database entries for missing files
+        if source_path:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, filepath FROM videos WHERE status NOT IN ('completed', 'skipped')")
+            db_files = cursor.fetchall()
+            
+            missing_count = 0
+            for file_id, filepath in db_files:
+                if not os.path.exists(filepath):
+                    cursor.execute("""
+                    UPDATE videos 
+                    SET status = 'skipped', skip_reason = ? 
+                    WHERE id = ?
+                    """, ('File no longer exists on disk', file_id))
+                    missing_count += 1
+                    log.warning(f"File in database no longer exists: {filepath}")
+            
+            if missing_count > 0:
+                conn.commit()
+                log.warning(f"Marked {missing_count} files as missing because they no longer exist on disk.")
+        
+        # Register all videos in database
+        for video_path in videos:
+            register_video(conn, video_path)
+        
+        # Display initial status
+        display_status(conn)
+        
+        # If analyze_only mode, don't proceed with transcoding
+        if analyze_only:
+            log.info("Analysis complete. Not performing transcoding (--analyze-only specified).")
+            return
+        
+        # Process videos that haven't been completed
         cursor = conn.cursor()
-        # Get all files in the database that aren't already marked as completed or skipped
-        cursor.execute("SELECT id, filepath FROM videos WHERE status NOT IN ('completed', 'skipped')")
-        db_files = cursor.fetchall()
+        where_clause = "status = 'pending'"
+        if config.DATABASE['retry_errors']:
+            where_clause += " OR status = 'error'"
         
-        missing_count = 0
-        for file_id, filepath in db_files:
-            if not os.path.exists(filepath):
-                # File no longer exists, mark as missing
+        cursor.execute(f"SELECT id, filepath FROM videos WHERE {where_clause}")
+        pending_videos = cursor.fetchall()
+        
+        # Filter out files that no longer exist
+        valid_pending_videos = []
+        for video_id, video_path in pending_videos:
+            if os.path.exists(video_path):
+                valid_pending_videos.append((video_id, video_path))
+            else:
                 cursor.execute("""
                 UPDATE videos 
                 SET status = 'skipped', skip_reason = ? 
                 WHERE id = ?
-                """, ('File no longer exists on disk', file_id))
-                missing_count += 1
-                log.warning(f"File in database no longer exists: {filepath}")
+                """, ('File no longer exists on disk', video_id))
+                log.warning(f"Skipping missing file: {video_path}")
         
-        if missing_count > 0:
-            conn.commit()
-            console.print(f"[{config.UI['warning_style']}]Marked {missing_count} files as missing because they no longer exist on disk.[/{config.UI['warning_style']}]")
-    
-    # Register all videos in database
-    for video_path in videos:
-        register_video(conn, video_path)
-    
-    # Display initial status
-    display_status(conn, console)
-    
-    # If analyze_only mode, don't proceed with transcoding
-    if analyze_only:
-        console.print(f"[{config.UI['info_style']}]Analysis complete. Not performing transcoding (--analyze-only specified).[/{config.UI['info_style']}]")
-        return
-    
-    # Process videos that haven't been completed
-    cursor = conn.cursor()
-    where_clause = "status = 'pending'"
-    if config.DATABASE['retry_errors']:
-        where_clause += " OR status = 'error'"
-    
-    cursor.execute(f"SELECT id, filepath FROM videos WHERE {where_clause}")
-    pending_videos = cursor.fetchall()
-    
-    # Filter out files that no longer exist
-    valid_pending_videos = []
-    for video_id, video_path in pending_videos:
-        if os.path.exists(video_path):
-            valid_pending_videos.append((video_id, video_path))
-        else:
-            # Update status in database
-            cursor.execute("""
-            UPDATE videos 
-            SET status = 'skipped', skip_reason = ? 
-            WHERE id = ?
-            """, ('File no longer exists on disk', video_id))
-            log.warning(f"Skipping missing file: {video_path}")
-    
-    # Commit any changes to database
-    conn.commit()
-    
-    # Use the filtered list
-    pending_videos = valid_pending_videos
-    
-    if not pending_videos:
-        console.print(f"[{config.UI['header_style']}]All videos have been processed![/{config.UI['header_style']}]")
-        return
-    
-    console.print(f"[{config.UI['info_style']}]Processing {len(pending_videos)} videos...[/{config.UI['info_style']}]")
-    
-    for video_id, video_path in pending_videos:
-        # Check if exit has been requested
-        if exit_requested:
-            break
+        conn.commit()
+        pending_videos = valid_pending_videos
         
-        # Double-check file still exists (it might have been deleted during processing)
-        if not os.path.exists(video_path):
-            log.warning(f"File disappeared during processing: {video_path}")
-            # Update status in database
-            cursor = conn.cursor()
-            cursor.execute("""
-            UPDATE videos 
-            SET status = 'skipped', skip_reason = ? 
-            WHERE id = ?
-            """, ('File disappeared during processing', video_id))
-            conn.commit()
-            continue
+        if not pending_videos:
+            log.info("All videos have been processed!")
+            return
+        
+        log.info(f"Processing {len(pending_videos)} videos...")
+        
+        for video_id, video_path in pending_videos:
+            if exit_requested:
+                break
             
-        base_name = os.path.basename(video_path)
-        directory = os.path.dirname(video_path)
-        temp_path = os.path.join(directory, f"temp_{base_name}")
-        
-        # Update global current_temp_file for signal handler
-        current_temp_file = temp_path
-        
-        console.print(f"[{config.UI['info_style']}]Processing: {base_name}[/{config.UI['info_style']}]")
-        
-        # Display detailed analysis before processing
-        analyze_video(video_path, console)
-        
-        with Progress(
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            TimeRemainingColumn(),
-            console=console
-        ) as progress:
-            task = progress.add_task(f"Transcoding {base_name}", total=1.0)
+            # Double-check file still exists
+            if not os.path.exists(video_path):
+                log.warning(f"File disappeared during processing: {video_path}")
+                cursor = conn.cursor()
+                cursor.execute("""
+                UPDATE videos 
+                SET status = 'skipped', skip_reason = ? 
+                WHERE id = ?
+                """, ('File disappeared during processing', video_id))
+                conn.commit()
+                continue
             
-            def update_progress(value):
-                progress.update(task, completed=value)
+            base_name = os.path.basename(video_path)
+            directory = os.path.dirname(video_path)
+            temp_path = os.path.join(directory, f"temp_{base_name}")
             
-            success = transcode_video(video_path, temp_path, video_id, conn, update_progress)
+            current_temp_file = temp_path
+            log.info(f"Processing: {base_name}")
+            
+            # Display detailed analysis
+            analyze_video(video_path)
+            
+            # Start progress tracking
+            ui.start_progress(f"Transcoding {base_name}")
+            
+            success = transcode_video(video_path, temp_path, video_id, conn, ui.update_progress)
+            
+            # Stop progress tracking
+            ui.stop_progress()
             
             if success and not exit_requested:
-                # Verify the temp file exists
                 if os.path.exists(temp_path):
-                    # Verify the source file still exists
                     if os.path.exists(video_path):
-                        # Replace original with transcoded version
                         os.remove(video_path)
                         os.rename(temp_path, video_path)
                         log.info(f"Successfully transcoded: {video_path}")
                     else:
                         log.error(f"Source file disappeared during transcoding: {video_path}")
-                        # Don't delete the temp file in this case, it contains the output
                         cursor = conn.cursor()
                         cursor.execute("""
                         UPDATE videos 
@@ -874,25 +1065,20 @@ def process_videos(source_path, analyze_only=False, target_video=None):
                 log.error(f"Failed to transcode: {video_path}")
                 if os.path.exists(temp_path):
                     os.remove(temp_path)
+            
+            current_temp_file = None
+            display_status(conn)
+            
+            if exit_requested:
+                break
         
-        # Reset current_temp_file
-        current_temp_file = None
-        
-        # Update status after each video
-        display_status(conn, console)
-        
-        # Check again if exit has been requested
-        if exit_requested:
-            break
+        if not exit_requested:
+            log.info("Video transcoding process completed!")
+            display_status(conn)
     
-    if not exit_requested:
-        console.print(f"[{config.UI['header_style']}]Video transcoding process completed![/{config.UI['header_style']}]")
-        
-        # Final status display
-        display_status(conn, console)
-    
-    # Close database connection
-    conn.close()
+    finally:
+        ui.stop()
+        conn.close()
 
 def main():
     """Parse arguments and start the video processing."""
