@@ -31,19 +31,22 @@ console = Console()
 log_level = getattr(logging, config.LOGGING['level'])
 log_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
-# File handler with rotation
+# File handler with rotation - set to DEBUG to capture all details
 file_handler = RotatingFileHandler(
     config.LOGGING['filename'],
     maxBytes=config.LOGGING['max_size'],
     backupCount=config.LOGGING['backup_count']
 )
 file_handler.setFormatter(log_formatter)
+file_handler.setLevel(logging.DEBUG)  # Always capture debug in file
 
-# Console handler with rich formatting
+# Console handler with rich formatting - use configured level
 console_handler = RichHandler(rich_tracebacks=True)
+console_handler.setLevel(log_level)  # Use configured level for console
 
+# Set root logger to DEBUG to allow everything through
 logging.basicConfig(
-    level=log_level,
+    level=logging.DEBUG,  # Capture everything, handlers will filter
     format="%(message)s",
     datefmt="[%X]",
     handlers=[console_handler, file_handler]
@@ -357,6 +360,15 @@ def transcode_video(video_path, temp_path, video_id, conn, progress_callback=Non
         cmd.extend([
             '-c:a', audio_codec,
             '-b:a', audio_bitrate,
+        ])
+        
+        # Add metadata about our processing
+        cmd.extend([
+            '-metadata', f'encoded_by=video_reconvert v1.0',
+            '-metadata', f'encoding_tool={codec}',
+            '-metadata', f'encoding_settings={json.dumps(custom_settings) if custom_settings else "default"}',
+            '-metadata', f'original_size={format_size(info["size"])}',
+            '-metadata', f'encoding_date={datetime.now().isoformat()}',
             '-y'  # Overwrite output file
         ])
         
@@ -372,8 +384,19 @@ def transcode_video(video_path, temp_path, video_id, conn, progress_callback=Non
         # Add output path
         cmd.append(temp_path)
         
-        # Log the full command for debugging
-        log.debug(f"FFmpeg command: {' '.join(cmd)}")
+        # Log the detailed command info to debug log only
+        debug_message = "\nExecuting ffmpeg command:\n"
+        debug_message += "=" * 80 + "\n"
+        debug_message += f"Input file: {video_path}\n"
+        debug_message += f"Output file: {temp_path}\n"
+        debug_message += f"Full command: {' '.join(cmd)}\n"
+        if custom_settings:
+            debug_message += f"Custom settings: {json.dumps(custom_settings, indent=2)}\n"
+        debug_message += "=" * 80
+        log.debug(debug_message)
+        
+        # Log a simpler message for info level
+        log.info(f"Starting ffmpeg conversion of: {os.path.basename(video_path)}")
         
         # Start FFmpeg process
         process = subprocess.Popen(
