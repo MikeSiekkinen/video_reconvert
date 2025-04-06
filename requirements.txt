@@ -1,0 +1,4 @@
+# Rich for beautiful terminal output
+rich>=13.7.0
+
+# All other imports are from Python standard library 
