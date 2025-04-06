@@ -440,3 +440,11 @@ def get_optimal_encoding_settings(video_info: Dict[str, Any]) -> Dict[str, Any]:
         settings['crf'] = min(settings['crf'] + 2, 32)
     
     return settings 
+
+def was_processed_by_tool(info):
+    """Check if a video was already processed by video_reconvert."""
+    if not info or 'format' not in info or 'tags' not in info['format']:
+        return False
+    
+    tags = info['format']['tags']
+    return 'comment' in tags and tags['comment'].startswith('Processed by video_reconvert') 

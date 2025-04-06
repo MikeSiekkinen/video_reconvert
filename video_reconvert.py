@@ -266,6 +266,22 @@ def register_video(conn, video_path):
         conn.commit()
         return None
     
+    # Check if this file was already processed by our tool
+    if video_utils.was_processed_by_tool(info) and not config.VIDEO_ENCODING['force_reconvert']:
+        cursor.execute("""
+        INSERT INTO videos 
+        (filepath, status, date_added, skip_reason) 
+        VALUES (?, ?, ?, ?)
+        """, (
+            video_path, 
+            'skipped', 
+            datetime.now(),
+            'Already processed by video_reconvert'
+        ))
+        conn.commit()
+        log.info(f"Skipping already processed video: {video_path}")
+        return None
+    
     # Run sanity checks
     issues = video_utils.run_sanity_checks(info)
     
@@ -362,16 +378,6 @@ def transcode_video(video_path, temp_path, video_id, conn, progress_callback=Non
             '-b:a', audio_bitrate,
         ])
         
-        # Add metadata about our processing
-        cmd.extend([
-            '-metadata', f'encoded_by=video_reconvert v1.0',
-            '-metadata', f'encoding_tool={codec}',
-            '-metadata', f'encoding_settings={json.dumps(custom_settings) if custom_settings else "default"}',
-            '-metadata', f'original_size={format_size(info["size"])}',
-            '-metadata', f'encoding_date={datetime.now().isoformat()}',
-            '-y'  # Overwrite output file
-        ])
-        
         # Add any custom extra parameters if specified
         if 'extra_params' in custom_settings and custom_settings['extra_params']:
             cmd.extend(custom_settings['extra_params'])
@@ -380,6 +386,15 @@ def transcode_video(video_path, temp_path, video_id, conn, progress_callback=Non
             base_extra_params = config.VIDEO_ENCODING['extra_params']
             if isinstance(base_extra_params, list):
                 cmd.extend(base_extra_params)
+        
+        # Add metadata about our processing (using more compatible tags)
+        settings_str = json.dumps(custom_settings) if custom_settings else "default"
+        cmd.extend([
+            '-metadata', 'comment=Processed by video_reconvert v1.0',
+            '-metadata', f'description=Original size: {format_size(info["size"])}. Encoded on {datetime.now().isoformat()} using {codec}. Settings: {settings_str}',
+            '-metadata', 'copyright=video_reconvert',
+            '-y'  # Overwrite output file
+        ])
         
         # Add output path
         cmd.append(temp_path)
@@ -882,6 +897,7 @@ def main():
     parser.add_argument('--no-retry-errors', action='store_false', dest='retry_errors', help='Skip files that previously failed')
     parser.add_argument('--analyze-only', action='store_true', help='Only analyze videos without transcoding')
     parser.add_argument('--analyze-video', help='Analyze a single video file without transcoding')
+    parser.add_argument('--force-reconvert', action='store_true', help='Allow reconverting files that were already processed')
     
     args = parser.parse_args()
     
@@ -905,6 +921,9 @@ def main():
     
     if args.retry_errors is not None:
         config.DATABASE['retry_errors'] = args.retry_errors
+        
+    if args.force_reconvert:
+        config.VIDEO_ENCODING['force_reconvert'] = True
     
     # If analyzing single video, use that mode
     if args.analyze_video:

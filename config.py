@@ -31,6 +31,9 @@ VIDEO_ENCODING = {
     'audio_codec': 'aac',        # More widely compatible than opus
     'audio_bitrate': '96k',      # Good balance of quality and size
     
+    # Processing control
+    'force_reconvert': False,    # When True, allows reconverting files that were already processed
+    
     # Additional ffmpeg parameters for better quality/compression
     'extra_params': [
         '-movflags', '+faststart',  # Optimize for web streaming
