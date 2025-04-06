@@ -343,8 +343,6 @@ def transcode_video(video_path, temp_path, video_id, conn, progress_callback=Non
         
         # Start with base parameters from config
         codec = custom_settings.get('codec', config.VIDEO_ENCODING['codec'])
-        crf = custom_settings.get('crf', config.VIDEO_ENCODING['crf'])
-        preset = config.VIDEO_ENCODING['preset']
         audio_codec = config.VIDEO_ENCODING['audio_codec']
         audio_bitrate = custom_settings.get('audio_bitrate', config.VIDEO_ENCODING['audio_bitrate'])
         
@@ -354,14 +352,6 @@ def transcode_video(video_path, temp_path, video_id, conn, progress_callback=Non
             '-i', video_path,
             '-c:v', codec,
         ]
-        
-        # Add CRF parameter if not using hardware acceleration, otherwise use quality parameter
-        if 'videotoolbox' in codec:
-            # For hardware encoding
-            cmd.extend(['-q:v', '50'])  # Quality parameter for videotoolbox
-        else:
-            # For software encoding
-            cmd.extend(['-crf', str(crf), '-preset', preset])
         
         # Add audio settings
         cmd.extend([
