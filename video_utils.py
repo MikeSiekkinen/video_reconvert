@@ -24,7 +24,8 @@ def check_ffmpeg_availability() -> bool:
 def get_video_info(filepath: str) -> Optional[Dict[str, Any]]:
     """Use ffprobe to extract comprehensive video metadata."""
     try:
-        # Check if the file exists
+        # Only check file existence and size right before accessing the file
+        # This avoids unnecessary I/O operations when working with large datasets
         if not os.path.exists(filepath):
             log.error(f"File does not exist: {filepath}")
             return None

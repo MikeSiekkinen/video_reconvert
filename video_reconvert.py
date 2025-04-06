@@ -680,6 +680,89 @@ def register_video(conn, video_path):
     
     return video_id
 
+def register_videos_batch(conn, video_paths, batch_size=500):
+    """Add multiple videos to the database in a single transaction for better performance.
+    
+    Args:
+        conn: Database connection
+        video_paths: List of video file paths to register
+        batch_size: Number of videos to process in each database transaction
+    
+    Returns:
+        List of video IDs that were registered as new
+    """
+    if not video_paths:
+        return []
+    
+    cursor = conn.cursor()
+    registered_ids = []
+    current_time = datetime.now()
+    
+    # Process in batches to avoid excessive memory usage with very large lists
+    total_batches = (len(video_paths) + batch_size - 1) // batch_size
+    for i in range(0, len(video_paths), batch_size):
+        batch_num = i // batch_size + 1
+        batch = video_paths[i:i+batch_size]
+        log.info(f"Processing registration batch {batch_num}/{total_batches} ({len(batch)} videos)")
+        
+        # First, check which videos are already in the database
+        placeholders = ','.join(['?'] * len(batch))
+        cursor.execute(f"""
+        SELECT filepath, id, status, skip_reason 
+        FROM videos 
+        WHERE filepath IN ({placeholders})
+        """, batch)
+        
+        existing_videos = {row[0]: (row[1], row[2], row[3]) for row in cursor.fetchall()}
+        
+        # Filter videos that need to be inserted
+        new_videos = []
+        for path in batch:
+            if path in existing_videos:
+                video_id, status, skip_reason = existing_videos[path]
+                if status == 'completed':
+                    log.debug(f"Video already processed: {path}")
+                elif status == 'skipped':
+                    log.debug(f"Video previously skipped: {path}. Reason: {skip_reason}")
+                elif status == 'error' and not config.DATABASE['retry_errors']:
+                    log.debug(f"Skipping previously failed video: {path}")
+                else:
+                    registered_ids.append(video_id)
+            else:
+                new_videos.append(path)
+        
+        # Insert all new videos in a single transaction
+        if new_videos:
+            log.debug(f"Inserting {len(new_videos)} new videos in batch")
+            
+            # Prepare the multi-value insert
+            values = [(path, 'pending', current_time) for path in new_videos]
+            cursor.executemany("""
+            INSERT INTO videos (filepath, status, date_added) 
+            VALUES (?, ?, ?)
+            """, values)
+            
+            # Get all inserted IDs
+            # Since SQLite doesn't support returning IDs from executemany, we need to query them
+            placeholders = ','.join(['?'] * len(new_videos))
+            cursor.execute(f"""
+            SELECT id FROM videos 
+            WHERE filepath IN ({placeholders}) AND status = 'pending'
+            """, new_videos)
+            
+            batch_ids = [row[0] for row in cursor.fetchall()]
+            registered_ids.extend(batch_ids)
+            
+            log.debug(f"Registered {len(batch_ids)} new videos")
+        
+        # Commit after each batch
+        conn.commit()
+        
+        # Provide a summary of progress so far
+        log.info(f"Registration progress: Completed batch {batch_num}/{total_batches}, {len(registered_ids)} videos registered so far")
+        
+    return registered_ids
+
 def calculate_target_resolution(width, height):
     """Calculate target resolution maintaining aspect ratio."""
     # Detect orientation
@@ -1159,10 +1242,10 @@ def update_video_metadata(conn, video_id, video_path):
     """Update video metadata in the database after analysis."""
     cursor = conn.cursor()
     
-    # Get comprehensive video info
+    # Get comprehensive video info - file existence is checked inside get_video_info
     info = get_video_info(video_path)
     if not info:
-        # Update as skipped due to info extraction failure
+        # Update as skipped due to info extraction failure (which could be due to missing file)
         cursor.execute("""
         UPDATE videos 
         SET status = 'skipped',
@@ -1302,16 +1385,10 @@ def process_videos(source_path, analyze_only=False, target_video=None):
                 conn.commit()
                 log.warning(f"Marked {missing_count} files as missing because they no longer exist on disk.")
         
-        # Register all videos in database
-        log.debug(f"Starting registration of {len(videos)} videos")
-        registration_count = 0
-        for video_path in videos:
-            log.debug(f"Registering video {registration_count + 1}/{len(videos)}: {video_path}")
-            register_video(conn, video_path)
-            registration_count += 1
-            if registration_count % 100 == 0:
-                log.debug(f"Registered {registration_count}/{len(videos)} videos")
-        log.debug("Completed video registration")
+        # Register all videos in database using batch operation
+        log.info(f"Starting batch registration of {len(videos)} videos")
+        registered_ids = register_videos_batch(conn, videos)
+        log.info(f"Completed batch registration of {len(videos)} videos, {len(registered_ids)} new entries")
         
         # Display initial status
         log.debug("Gathering statistics for initial status display")
@@ -1333,26 +1410,24 @@ def process_videos(source_path, analyze_only=False, target_video=None):
         pending_videos = cursor.fetchall()
         log.debug(f"Found {len(pending_videos)} pending videos to process")
         
-        # Filter out files that no longer exist
-        log.debug("Filtering out non-existent files from pending videos")
+        # Update metadata for all pending videos
+        # We'll only check file existence during the actual processing stage
+        # to avoid unnecessary I/O operations
+        log.info(f"Updating metadata for {len(pending_videos)} pending videos")
         valid_pending_videos = []
+        meta_count = 0
         for video_id, video_path in pending_videos:
-            log.debug(f"Checking if pending video exists: {video_path}")
-            if os.path.exists(video_path):
-                # Update metadata and check if we should process this video
-                log.debug(f"Updating metadata for: {video_path}")
-                if update_video_metadata(conn, video_id, video_path):
-                    valid_pending_videos.append((video_id, video_path))
-            else:
-                log.debug(f"Pending video no longer exists, marking as skipped: {video_path}")
-                cursor.execute("""
-                UPDATE videos 
-                SET status = 'skipped', skip_reason = ? 
-                WHERE id = ?
-                """, ('File no longer exists on disk', video_id))
-                log.warning(f"Skipping missing file: {video_path}")
+            log.debug(f"Updating metadata for: {video_path}")
+            if update_video_metadata(conn, video_id, video_path):
+                valid_pending_videos.append((video_id, video_path))
+            
+            # Add heartbeat logging for visibility during processing large datasets
+            meta_count += 1
+            if meta_count % 100 == 0:
+                log.info(f"Metadata update progress: {meta_count}/{len(pending_videos)} videos ({(meta_count/len(pending_videos)*100):.1f}%)")
         
-        log.debug("Committing changes after filtering pending videos")
+        log.info(f"Metadata update complete: {meta_count} videos processed, {len(valid_pending_videos)} valid for conversion")
+        log.debug("Committing changes after updating video metadata")
         conn.commit()
         pending_videos = valid_pending_videos
         
@@ -1366,17 +1441,8 @@ def process_videos(source_path, analyze_only=False, target_video=None):
             if exit_requested:
                 break
             
-            # Double-check file still exists
-            if not os.path.exists(video_path):
-                log.warning(f"File disappeared during processing: {video_path}")
-                cursor = conn.cursor()
-                cursor.execute("""
-                UPDATE videos 
-                SET status = 'skipped', skip_reason = ? 
-                WHERE id = ?
-                """, ('File disappeared during processing', video_id))
-                conn.commit()
-                continue
+            # Note: File existence is now checked directly in the get_video_info and transcode_video functions
+            # rather than checking multiple times throughout the process
             
             base_name = os.path.basename(video_path)
             directory = os.path.dirname(video_path)
