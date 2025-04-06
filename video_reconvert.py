@@ -315,6 +315,8 @@ class VideoReconvertUI:
         """Update the progress bar"""
         if self.current_task is not None:
             self.progress.update(self.current_task, completed=value)
+            # Force a refresh of the display after updating progress
+            self.update_dashboard(self.detail_content)
             
     def stop_progress(self):
         """Stop the current progress bar"""
@@ -596,7 +598,7 @@ def find_videos(source_path):
     
     # Exclude temp files that match our temp file pattern
     def is_temp_file(filename):
-        return filename.startswith('.temp_')
+        return filename.startswith('temp_') or filename.startswith('.temp_') or filename.startswith('.progress_')
     
     for root, dirs, files in os.walk(source_path):
         # Remove directories to skip from the list (in-place)
@@ -851,13 +853,18 @@ def transcode_video(video_path, temp_path, video_id, conn, progress_callback=Non
             conn.commit()
             return False
         
+        # Create a temp directory for progress files if it doesn't exist
+        temp_dir = os.path.join(os.path.dirname(video_path), '.video_reconvert_temp')
+        os.makedirs(temp_dir, exist_ok=True)
+        
         # Prepare FFmpeg command
         cmd = [
             'ffmpeg',
             '-i', video_path,
             '-c:v', settings['codec'],
             '-c:a', 'aac',
-            '-b:a', settings['audio_bitrate']
+            '-b:a', settings['audio_bitrate'],
+            '-progress', 'pipe:1'  # Write progress to stdout
         ]
         
         # Add all extra parameters
@@ -866,9 +873,10 @@ def transcode_video(video_path, temp_path, video_id, conn, progress_callback=Non
         # Add metadata
         settings_str = json.dumps(settings)
         cmd.extend([
-            '-metadata', 'comment=Processed by video_reconvert v1.0',
-            '-metadata', f'description=Original size: {format_size(info["size"])}. Encoded on {datetime.now().isoformat()} using {settings["codec"]}. Settings: {settings_str}',
-            '-metadata', 'copyright=video_reconvert',
+            '-metadata', f'comment=Processed by video_reconvert v1.0',
+            '-metadata', f'description=Original size: {format_size(info["size"])}',
+            '-metadata', f'encoding_settings={settings_str}',
+            '-metadata', f'copyright=video_reconvert',
             '-y',  # Overwrite output file
             temp_path
         ])
@@ -883,41 +891,80 @@ def transcode_video(video_path, temp_path, video_id, conn, progress_callback=Non
         debug_message += "=" * 80
         log.debug(debug_message)
         
-        # Create process
+        # Create process with pipes for both stdout and stderr
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            universal_newlines=True
+            universal_newlines=True,
+            bufsize=1  # Line buffered
         )
         
         # Monitor progress
         duration = float(info['duration'])
-        pattern = re.compile(r'time=(\d+:\d+:\d+.\d+)')
+        current_time = 0
+        progress_data = {}
+        stderr_output = []
         
         while True:
-            line = process.stderr.readline()
-            if not line and process.poll() is not None:
+            # Check if process has ended
+            if process.poll() is not None:
                 break
                 
-            # Extract time progress
-            match = pattern.search(line)
-            if match and progress_callback:
-                time_str = match.group(1)
-                current_time = sum(float(x) * 60 ** i for i, x in enumerate(reversed(time_str.replace('.', ':').split(':'))))
-                progress = min(1.0, current_time / duration)
-                progress_callback(video_id, progress)
+            # Use select to check which pipes have data
+            rlist, _, _ = select.select([process.stdout, process.stderr], [], [], 0.1)
+            
+            for ready_pipe in rlist:
+                if ready_pipe == process.stdout:
+                    # Handle progress data
+                    line = process.stdout.readline().strip()
+                    if line:
+                        if '=' in line:
+                            key, value = line.split('=', 1)
+                            progress_data[key] = value
+                            
+                            if key == 'out_time_ms' and value.isdigit():
+                                current_time = float(value) / 1000000  # Convert microseconds to seconds
+                                if duration > 0 and progress_callback:
+                                    progress = min(1.0, current_time / duration)
+                                    progress_callback(video_id, progress)
+                        
+                        if line == 'progress=end':
+                            break
+                            
+                elif ready_pipe == process.stderr:
+                    # Collect stderr output
+                    line = process.stderr.readline()
+                    if line:
+                        stderr_output.append(line)
+        
+        # Wait for process to complete with timeout
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            log.error("FFmpeg process had to be killed after timeout")
+            return False
+        
+        # Clean up temp directory if empty
+        try:
+            os.rmdir(temp_dir)
+        except OSError:
+            # Directory not empty or other error, just leave it
+            pass
         
         # Check process result
         if process.returncode != 0:
-            log.error(f"FFmpeg failed with return code {process.returncode}")
+            error_msg = f'FFmpeg failed with return code {process.returncode}: {"".join(stderr_output)}'
+            log.error(error_msg)
             cursor = conn.cursor()
             cursor.execute("""
                 UPDATE videos 
                 SET status = 'error',
                     error_message = ?
                 WHERE id = ?
-            """, (f'FFmpeg failed with return code {process.returncode}', video_id))
+            """, (error_msg, video_id))
             conn.commit()
             return False
             
