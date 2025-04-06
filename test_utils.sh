@@ -2,10 +2,11 @@
 
 # Default values
 MAX_FILES=5
-MAX_SIZE="300M"
+MAX_SIZE="1G"
+MIN_SIZE="100M"
 SOURCE_PATH="/Volumes/docker/TubeArchivist/media/UCQANb2YPwAtK-IQJrLaaUFw"
 DEST_PATH="vids"
-RESET_DB=true
+RESET_DB=false
 
 # Help message
 show_help() {
@@ -15,11 +16,12 @@ Usage: $0 [options] <source_path> <destination_path>
 Options:
     -n, --max-files NUM     Maximum number of files to copy (default: 5)
     -s, --max-size SIZE     Maximum size per file (e.g., "500M", "1G") (default: 1G)
+    -m, --min-size SIZE     Minimum size per file (e.g., "100M", "1G") (default: 100M)
     -r, --reset-db          Reset the SQLite database
     -h, --help             Show this help message
 
 Example:
-    $0 -n 10 -s 500M /path/to/source /path/to/destination
+    $0 -n 10 -s 500M -m 200M /path/to/source /path/to/destination
     $0 -r  # Only reset the database
 EOF
 }
@@ -33,6 +35,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -s|--max-size)
             MAX_SIZE="$2"
+            shift 2
+            ;;
+        -m|--min-size)
+            MIN_SIZE="$2"
             shift 2
             ;;
         -r|--reset-db)
@@ -61,8 +67,8 @@ done
 # Function to reset the database
 reset_database() {
     echo "Resetting SQLite database..."
-    if [[ -f videos.db ]]; then
-        rm videos.db
+    if [[ -f video_conversion.db ]]; then
+        rm video_conversion.db
         echo "Existing database deleted."
     fi
     # Create fresh database using the Python script
@@ -96,8 +102,8 @@ fi
 mkdir -p "$DEST_PATH"
 
 # Find video files, filter by size, and select random sample
-echo "Finding video files under $MAX_SIZE in size..."
-find "$SOURCE_PATH" -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.mov" -o -name "*.avi" \) -size -"$MAX_SIZE" | \
+echo "Finding video files between $MIN_SIZE and $MAX_SIZE in size..."
+find "$SOURCE_PATH" -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.mov" -o -name "*.avi" \) -size +"$MIN_SIZE" -size -"$MAX_SIZE" | \
     sort -R | \
     head -n "$MAX_FILES" > /tmp/files_to_copy.txt
 
