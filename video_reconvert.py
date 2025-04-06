@@ -24,10 +24,115 @@ from rich.prompt import Prompt
 from logging.handlers import RotatingFileHandler
 import config
 import video_utils
+from typing import Dict, Any
+import re
+import traceback
 
 # Global variables for cleanup
 current_temp_file = None
 exit_requested = False
+
+class FileRolodex:
+    def __init__(self, files, max_display=7):
+        self.files = files
+        self.max_display = max_display
+        self.current_index = 0
+        self.center_position = max_display // 2
+        self.file_status = {}  # Track status of each file: None=pending, True=success, False=failure, 'warning'=bloated
+        self.file_sizes = {}   # Track original and new sizes: {filename: (original_size, new_size)}
+        for file in files:
+            self.file_status[file] = None
+            self.file_sizes[file] = (None, None)
+        
+    def get_display_window(self):
+        """Calculate which files should be visible in the rolodex window"""
+        total_files = len(self.files)
+        
+        # If we have fewer files than max display, show them all
+        if total_files <= self.max_display:
+            start_idx = 0
+            end_idx = total_files
+        else:
+            # For first few files, keep display anchored at top
+            if self.current_index <= self.center_position:
+                start_idx = 0
+                end_idx = self.max_display
+            # For last few files, keep display anchored at bottom
+            elif self.current_index >= total_files - (self.max_display - self.center_position):
+                start_idx = total_files - self.max_display
+                end_idx = total_files
+            # For middle files, keep current file centered
+            else:
+                start_idx = self.current_index - self.center_position
+                end_idx = start_idx + self.max_display
+        
+        return self.files[start_idx:end_idx]
+    
+    def set_file_size(self, filename, original_size, new_size=None):
+        """Set the size information for a file"""
+        if filename in self.file_sizes:
+            self.file_sizes[filename] = (original_size, new_size)
+    
+    def create_table(self):
+        """Create a rich Table showing the current window of files"""
+        table = Table(show_header=True, box=None, padding=(0, 1))
+        table.add_column("Files to Process", style="bold")
+        
+        display_files = self.get_display_window()
+        start_idx = self.files.index(display_files[0])
+        
+        for i, file in enumerate(display_files, start=start_idx):
+            # Determine if this is the active file
+            is_active = (i == self.current_index)
+            # Use normal style for active file, dim for others
+            style = "" if is_active else "dim"
+            
+            # Add status indicator if file has been processed
+            status = self.file_status.get(file)
+            if status is True:
+                status_indicator = "[green]✓[/green] "
+            elif status is False:
+                status_indicator = "[red]✗[/red] "
+            elif status == 'warning':
+                status_indicator = "[yellow]⚠[/yellow] "
+            else:
+                status_indicator = "  "  # Two spaces for alignment
+            
+            # Format size information
+            orig_size, new_size = self.file_sizes.get(file, (None, None))
+            if orig_size is not None:
+                orig_size_str = format_size(orig_size)
+                if new_size is not None:
+                    # Show both sizes and percentage
+                    new_size_str = format_size(new_size)
+                    percentage = (new_size / orig_size * 100) if orig_size > 0 else 0
+                    size_info = f"({orig_size_str} → {new_size_str}, {percentage:.1f}%)"
+                else:
+                    # Show only original size
+                    size_info = f"({orig_size_str})"
+            else:
+                size_info = ""
+                
+            table.add_row(f"{status_indicator}{file} {size_info}", style=style)
+            
+        return table
+    
+    def set_file_status(self, filename, success):
+        """Set the status of a file after processing"""
+        if filename in self.file_status:
+            self.file_status[filename] = success
+
+    def advance_rolodex(self):
+        """Move to the next file"""
+        if self.current_index < len(self.files) - 1:
+            self.current_index += 1
+            
+    def set_current_file(self, filename):
+        """Set the current file by name"""
+        try:
+            self.current_index = self.files.index(filename)
+        except ValueError:
+            pass  # File not found in list, keep current index
 
 class VideoReconvertUI:
     def __init__(self):
@@ -47,7 +152,7 @@ class VideoReconvertUI:
         
         # Split left panel into global stats and details
         self.layout["left_panel"].split_column(
-            Layout(name="global_stats", size=10),  # Increased size to accommodate all rows including Space Saved
+            Layout(name="global_stats", size=12),  # Increased size to accommodate horizontal layout
             Layout(name="details")  # Takes remaining space
         )
         
@@ -73,7 +178,89 @@ class VideoReconvertUI:
         # Keep track of current content
         self.summary_table = None
         self.detail_content = None
+        self.rolodex = None
         
+    def update_dashboard(self, content):
+        """Update the dashboard section with both summary and detail content"""
+        if isinstance(content, Table):
+            # Check if this is a global stats table
+            if hasattr(content, 'is_global_stats'):
+                self.summary_table = content
+                
+                # Create a horizontal layout for the global stats panel
+                global_layout = Layout()
+                global_layout.split_row(
+                    Layout(name="stats", ratio=1),
+                    Layout(name="files", ratio=1)
+                )
+                
+                # Add the summary table to the left side
+                global_layout["stats"].update(self.summary_table)
+                
+                # Add the rolodex to the right side if we have one
+                if self.rolodex:
+                    rolodex_table = self.rolodex.create_table()
+                    global_layout["files"].update(rolodex_table)
+                
+                # Update the global stats panel with the combined layout
+                self.layout["global_stats"].update(
+                    Panel(
+                        global_layout,
+                        title="Global Progress",
+                        border_style=config.UI['header_style'],
+                        height=12  # Fixed height to accommodate both tables
+                    )
+                )
+            else:
+                # This is a detail table
+                self.detail_content = content
+                self._update_details_panel()
+        elif content is not None:
+            # This is other detail content
+            self.detail_content = content
+            self._update_details_panel()
+            
+    def initialize_rolodex(self, files, source_files=None):
+        """Initialize the file rolodex with list of files"""
+        self.rolodex = FileRolodex(files)
+        
+        # Map basenames to full paths if source_files is provided
+        file_map = {}
+        if source_files:
+            for full_path in source_files:
+                file_map[os.path.basename(full_path)] = full_path
+        
+        # Initialize file sizes using full paths
+        for file in files:
+            try:
+                # Get the full path if available
+                full_path = file_map.get(file) if file_map else None
+                if full_path and os.path.exists(full_path):
+                    info = get_video_info(full_path)
+                    if info and 'size' in info:
+                        self.rolodex.set_file_size(file, info['size'])
+            except Exception as e:
+                log.debug(f"Failed to get size for {file}: {str(e)}")
+                pass  # Skip if we can't get size info
+        
+        # Force a refresh of the dashboard to show the rolodex
+        if self.summary_table:
+            self.update_dashboard(self.summary_table)
+        
+    def set_current_file(self, filename):
+        """Update the current file in the rolodex"""
+        if self.rolodex:
+            self.rolodex.set_current_file(filename)
+            if self.summary_table:
+                self.update_dashboard(self.summary_table)
+            
+    def advance_rolodex(self):
+        """Move to the next file in the rolodex"""
+        if self.rolodex:
+            self.rolodex.advance_rolodex()
+            if self.summary_table:
+                self.update_dashboard(self.summary_table)
+            
     def start(self):
         """Start the live display"""
         self.live.start()
@@ -92,29 +279,6 @@ class VideoReconvertUI:
         self.layout["header"].update(
             Panel(text, style=config.UI['header_style'])
         )
-        
-    def update_dashboard(self, content):
-        """Update the dashboard section with both summary and detail content"""
-        if isinstance(content, Table):
-            # Check if this is a global stats table
-            if hasattr(content, 'is_global_stats'):
-                self.summary_table = content
-                # Update global stats panel
-                self.layout["global_stats"].update(
-                    Panel(
-                        self.summary_table,
-                        title="Global Progress",
-                        border_style=config.UI['header_style']
-                    )
-                )
-            else:
-                # This is a detail table
-                self.detail_content = content
-                self._update_details_panel()
-        elif content is not None:
-            # This is other detail content
-            self.detail_content = content
-            self._update_details_panel()
         
     def _update_details_panel(self):
         """Update the details panel with current content and progress"""
@@ -145,7 +309,7 @@ class VideoReconvertUI:
         # Don't clear content when starting progress
         self.update_dashboard(self.detail_content)
         
-    def update_progress(self, value):
+    def update_progress(self, video_id, value):
         """Update the progress bar"""
         if self.current_task is not None:
             self.progress.update(self.current_task, completed=value)
@@ -170,12 +334,10 @@ class VideoReconvertUI:
         """Update the log section with current messages"""
         # Format log messages with timestamp and level
         formatted_messages = []
-        last_timestamp = None
         
-        # Calculate padding for timestamp (HH:MM:SS = 8 chars + 1 space)
-        timestamp_width = 8  # HH:MM:SS
+        # Calculate padding for timestamp (YYYY-MM-DD HH:MM:SS = 19 chars + 1 space)
+        timestamp_width = 19  # YYYY-MM-DD HH:MM:SS
         level_width = 8      # For log level text
-        timestamp_padding = " " * (timestamp_width + 1)  # Space for "HH:MM:SS "
         
         for msg in self.log_messages[-30:]:  # Show last 30 messages
             try:
@@ -187,13 +349,6 @@ class VideoReconvertUI:
                     # Join the rest of the parts back together as the message
                     message = ' - '.join(parts[3:]) if len(parts) > 3 else ''
                     
-                    # Convert timestamp to simpler format (HH:MM:SS)
-                    try:
-                        dt = datetime.strptime(timestamp, '%Y-%m-%d %H:%M:%S,%f')
-                        simple_timestamp = dt.strftime('%H:%M:%S')
-                    except ValueError:
-                        simple_timestamp = timestamp
-                        
                     level_style = {
                         'ERROR': config.UI['error_style'],
                         'WARNING': config.UI['warning_style'],
@@ -201,13 +356,8 @@ class VideoReconvertUI:
                         'DEBUG': 'dim white'
                     }.get(level, '')
                     
-                    # Only show timestamp if it's different from the last one
-                    if simple_timestamp != last_timestamp:
-                        formatted_msg = f"[dim]{simple_timestamp:>{timestamp_width}}[/dim] [{level_style}]{level:<{level_width}}[/{level_style}] {message}"
-                        last_timestamp = simple_timestamp
-                    else:
-                        formatted_msg = f"{timestamp_padding}[{level_style}]{level:<{level_width}}[/{level_style}] {message}"
-                    
+                    # Always show timestamp with consistent width
+                    formatted_msg = f"[dim]{timestamp:<{timestamp_width}}[/dim] [{level_style}]{level:<{level_width}}[/{level_style}] {message}"
                     formatted_messages.append(formatted_msg)
                 else:
                     formatted_messages.append(msg)
@@ -226,6 +376,18 @@ class VideoReconvertUI:
         result = Prompt.ask(message)
         self.live.start()
         return result
+
+    def set_file_status(self, filename, success):
+        """Set the status of a file in the rolodex"""
+        if self.rolodex:
+            self.rolodex.set_file_status(filename, success)
+
+    def update_file_size(self, filename, new_size):
+        """Update the new size of a file in the rolodex"""
+        if self.rolodex:
+            orig_size, _ = self.rolodex.file_sizes.get(filename, (None, None))
+            if orig_size is not None:
+                self.rolodex.set_file_size(filename, orig_size, new_size)
 
 # Create global UI instance
 ui = VideoReconvertUI()
@@ -264,10 +426,11 @@ console_handler = UIRichHandler(
     show_time=True,
     show_level=True,
     show_path=False,
-    enable_link_path=False
+    enable_link_path=False,
+    omit_repeated_times=False  # Ensure timestamps are always shown
 )
 console_handler.setFormatter(log_formatter)
-console_handler.setLevel(log_level)  # Use configured level for console
+console_handler.setLevel(log_level)
 
 # Set root logger to DEBUG to allow everything through
 logging.basicConfig(
@@ -278,24 +441,26 @@ logging.basicConfig(
 )
 log = logging.getLogger("video_reconvert")
 
-# Signal handler for graceful exit
+# Create console instance at module level
+console = Console()
+
 def handle_exit_signal(sig, frame):
     global exit_requested, current_temp_file
     exit_requested = True
     
     log.info("Interrupt received, cleaning up and exiting gracefully...")
-    console.print(f"[{config.UI['info_style']}]Interrupt received, cleaning up and exiting gracefully...[/{config.UI['info_style']}]")
+    log.info("Interrupt received, cleaning up and exiting gracefully...")
     
     # Clean up current temp file if it exists
     if current_temp_file and os.path.exists(current_temp_file):
         try:
             log.info(f"Removing temp file: {current_temp_file}")
             os.remove(current_temp_file)
-            console.print(f"[{config.UI['info_style']}]Removed temp file: {current_temp_file}[/{config.UI['info_style']}]")
+            log.info(f"Removed temp file: {current_temp_file}")
         except Exception as e:
             log.error(f"Failed to remove temp file {current_temp_file}: {str(e)}")
     
-    console.print(f"[{config.UI['header_style']}]Exiting video_reconvert...[/{config.UI['header_style']}]")
+    log.info("Exiting video_reconvert...")
     sys.exit(0)
 
 # Register signal handlers
@@ -348,7 +513,8 @@ def setup_database():
         date_completed TIMESTAMP,
         error_message TEXT,
         skip_reason TEXT,
-        custom_settings TEXT
+        custom_settings TEXT,
+        is_bloated BOOLEAN DEFAULT 0
     )
     ''')
     
@@ -367,21 +533,25 @@ def setup_database():
     current_version = result[0] if result else 0
     
     # Current schema version
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2  # Increased version number
     
     if current_version < SCHEMA_VERSION:
         log.info(f"Updating database schema from version {current_version} to {SCHEMA_VERSION}")
         
-        # Verify required columns exist
+        # Add new columns if they don't exist
         try:
-            # Check if we need to add the skip_reason column
+            cursor.execute("SELECT is_bloated FROM videos LIMIT 1")
+        except sqlite3.OperationalError:
+            log.info("Adding is_bloated column to videos table")
+            cursor.execute("ALTER TABLE videos ADD COLUMN is_bloated BOOLEAN DEFAULT 0")
+        
+        try:
             cursor.execute("SELECT skip_reason FROM videos LIMIT 1")
         except sqlite3.OperationalError:
             log.info("Adding skip_reason column to videos table")
             cursor.execute("ALTER TABLE videos ADD COLUMN skip_reason TEXT")
         
         try:
-            # Check if we need to add the custom_settings column
             cursor.execute("SELECT custom_settings FROM videos LIMIT 1")
         except sqlite3.OperationalError:
             log.info("Adding custom_settings column to videos table")
@@ -554,199 +724,251 @@ def register_video(conn, video_path):
     conn.commit()
     return cursor.lastrowid
 
+def calculate_target_resolution(width, height):
+    """Calculate target resolution maintaining aspect ratio."""
+    # Detect orientation
+    is_vertical = height > width
+    aspect_ratio = height / width if is_vertical else width / height
+    
+    if is_vertical:
+        # Vertical video (shorts/reels format)
+        target_width = 606  # Base width for vertical videos
+        target_height = int(target_width * aspect_ratio)
+    else:
+        # Landscape video
+        target_height = 720  # Standard height for landscape
+        target_width = int(target_height * aspect_ratio)
+    
+    # Ensure dimensions are even (required for some codecs)
+    target_width = (target_width // 2) * 2
+    target_height = (target_height // 2) * 2
+    
+    return target_width, target_height
+
+def calculate_target_bitrate(info):
+    """Calculate target bitrate based on video properties."""
+    input_bitrate = info.get('bit_rate', 0)
+    width = info['video'].get('width', 0)
+    height = info['video'].get('height', 0)
+    fps = eval(info['video'].get('r_frame_rate', '30/1'))
+    
+    # Calculate default target based on resolution and fps
+    pixels = width * height
+    if pixels > 2073600:  # > 1080p
+        default_target = 6000000  # 6Mbps
+    elif pixels > 921600:  # > 720p
+        default_target = 4000000  # 4Mbps
+    else:
+        default_target = 2500000  # 2.5Mbps
+    
+    # Adjust for frame rate
+    if fps > 30:
+        default_target *= 1.5
+    
+    # Never exceed input bitrate
+    return min(input_bitrate, default_target) if input_bitrate > 0 else default_target
+
+def get_optimal_encoding_settings(video_info: Dict[str, Any]) -> Dict[str, Any]:
+    """Determine optimal encoding settings for a specific video."""
+    if not video_info or 'video' not in video_info:
+        return {}
+    
+    # Calculate target resolution
+    target_width, target_height = calculate_target_resolution(
+        video_info['video']['width'],
+        video_info['video']['height']
+    )
+    
+    # Calculate target bitrate
+    target_bitrate = calculate_target_bitrate(video_info)
+    
+    # Start with base settings
+    settings = {
+        'codec': 'hevc_videotoolbox',  # Using hardware encoding for speed
+        'extra_params': []
+    }
+    
+    # Add scaling parameters
+    if (target_width != video_info['video']['width'] or 
+        target_height != video_info['video']['height']):
+        settings['extra_params'].extend([
+            '-vf', f'scale={target_width}:{target_height}'
+        ])
+    
+    # Set audio bitrate (scale with video bitrate but cap at 128k)
+    audio_bitrate = min(int(target_bitrate * 0.05 / 1000), 128)
+    settings['audio_bitrate'] = f"{audio_bitrate}k"
+    
+    # Add quality settings for hardware encoder
+    settings['extra_params'].extend([
+        '-q:v', '35',  # Quality setting for videotoolbox (higher number = lower quality/size)
+        '-b:v', f'{target_bitrate}',  # Target video bitrate
+        '-maxrate', f'{target_bitrate}',  # Maximum bitrate
+        '-bufsize', f'{target_bitrate * 2}',  # Buffer size (2x target for flexibility)
+        '-tag:v', 'hvc1'  # Better compatibility
+    ])
+    
+    # Handle HDR content if present
+    if (video_info['video'].get('color_transfer') in ['arib-std-b67', 'smpte2084', 'smpte2086'] or
+        video_info['video'].get('color_primaries') in ['bt2020']):
+        settings['extra_params'].extend([
+            '-allow_sw', '1',
+            '-pix_fmt', 'p010le'
+        ])
+    
+    return settings
+
 def transcode_video(video_path, temp_path, video_id, conn, progress_callback=None):
     """Transcode the video to save space while maintaining quality."""
-    global exit_requested
-    
     try:
-        # First, check if the source file exists
-        if not os.path.exists(video_path):
-            log.error(f"Source file does not exist: {video_path}")
-            cursor = conn.cursor()
-            cursor.execute("""
-            UPDATE videos 
-            SET status = 'skipped', skip_reason = ? 
-            WHERE id = ?
-            """, ('Source file does not exist', video_id))
-            conn.commit()
-            return False
-            
-        # Ensure temp directory exists
-        temp_dir = os.path.dirname(temp_path)
-        if not os.path.exists(temp_dir):
-            try:
-                os.makedirs(temp_dir)
-            except OSError as e:
-                log.error(f"Failed to create temp directory {temp_dir}: {e}")
-                return False
-                
-        # Get video info for this specific file
+        # Get video info
         info = get_video_info(video_path)
         if not info:
+            log.error(f"Failed to get video info for {video_path}")
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE videos 
+                SET status = 'error',
+                    error_message = ?
+                WHERE id = ?
+            """, ('Failed to get video info', video_id))
+            conn.commit()
             return False
-            
-        # Check for custom encoding settings in database
-        cursor = conn.cursor()
-        cursor.execute("SELECT custom_settings FROM videos WHERE id = ?", (video_id,))
-        custom_settings_json = cursor.fetchone()[0]
         
-        # Parse custom settings if available
-        custom_settings = json.loads(custom_settings_json) if custom_settings_json else {}
+        # Get optimal encoding settings
+        settings = get_optimal_encoding_settings(info)
+        if not settings:
+            log.error(f"Failed to determine encoding settings for {video_path}")
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE videos 
+                SET status = 'error',
+                    error_message = ?
+                WHERE id = ?
+            """, ('Failed to determine encoding settings', video_id))
+            conn.commit()
+            return False
         
-        # Start with base parameters from config
-        codec = custom_settings.get('codec', config.VIDEO_ENCODING['codec'])
-        audio_codec = config.VIDEO_ENCODING['audio_codec']
-        audio_bitrate = custom_settings.get('audio_bitrate', config.VIDEO_ENCODING['audio_bitrate'])
-        
-        # Prepare FFmpeg command using config settings and any custom overrides
+        # Prepare FFmpeg command
         cmd = [
             'ffmpeg',
             '-i', video_path,
-            '-c:v', codec,
+            '-c:v', settings['codec'],
+            '-c:a', 'aac',
+            '-b:a', settings['audio_bitrate']
         ]
         
-        # Add audio settings
-        cmd.extend([
-            '-c:a', audio_codec,
-            '-b:a', audio_bitrate,
-        ])
+        # Add all extra parameters
+        cmd.extend(settings['extra_params'])
         
-        # Add any custom extra parameters if specified
-        if 'extra_params' in custom_settings and custom_settings['extra_params']:
-            cmd.extend(custom_settings['extra_params'])
-        else:
-            # Otherwise use the default extra params from config
-            base_extra_params = config.VIDEO_ENCODING['extra_params']
-            if isinstance(base_extra_params, list):
-                cmd.extend(base_extra_params)
-        
-        # Add metadata about our processing (using more compatible tags)
-        settings_str = json.dumps(custom_settings) if custom_settings else "default"
+        # Add metadata
+        settings_str = json.dumps(settings)
         cmd.extend([
             '-metadata', 'comment=Processed by video_reconvert v1.0',
-            '-metadata', f'description=Original size: {format_size(info["size"])}. Encoded on {datetime.now().isoformat()} using {codec}. Settings: {settings_str}',
+            '-metadata', f'description=Original size: {format_size(info["size"])}. Encoded on {datetime.now().isoformat()} using {settings["codec"]}. Settings: {settings_str}',
             '-metadata', 'copyright=video_reconvert',
-            '-y'  # Overwrite output file
+            '-y',  # Overwrite output file
+            temp_path
         ])
         
-        # Add output path
-        cmd.append(temp_path)
-        
-        # Log the detailed command info to debug log only
+        # Log the detailed command info
         debug_message = "\nExecuting ffmpeg command:\n"
         debug_message += "=" * 80 + "\n"
         debug_message += f"Input file: {video_path}\n"
         debug_message += f"Output file: {temp_path}\n"
         debug_message += f"Full command: {' '.join(cmd)}\n"
-        if custom_settings:
-            debug_message += f"Custom settings: {json.dumps(custom_settings, indent=2)}\n"
+        debug_message += f"Settings: {json.dumps(settings, indent=2)}\n"
         debug_message += "=" * 80
         log.debug(debug_message)
         
-        # Log a simpler message for info level
-        log.info(f"Starting ffmpeg conversion of: {os.path.basename(video_path)}")
-        
-        # Start FFmpeg process
+        # Create process
         process = subprocess.Popen(
-            cmd, 
-            stdout=subprocess.PIPE, 
+            cmd,
+            stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             universal_newlines=True
         )
         
         # Monitor progress
-        duration = info['duration']
-        ffmpeg_process_terminated = False
+        duration = float(info['duration'])
+        pattern = re.compile(r'time=(\d+:\d+:\d+.\d+)')
         
-        # Setup non-blocking read
-        import select
-        
-        # File descriptors to monitor
-        fd_stderr = process.stderr.fileno()
-        
-        # Use select to wait for data
-        while process.poll() is None:
-            # Check if we've been asked to exit
-            if exit_requested:
-                log.info("Exit requested, terminating FFmpeg process")
-                process.terminate()
-                ffmpeg_process_terminated = True
+        while True:
+            line = process.stderr.readline()
+            if not line and process.poll() is not None:
                 break
                 
-            # Wait for data (with timeout)
-            readable, _, _ = select.select([fd_stderr], [], [], 0.5)
-            
-            if fd_stderr in readable:
-                line = process.stderr.readline()
-                if not line:
-                    break
-                    
-                if "time=" in line:
-                    time_match = line.split("time=")[1].split()[0]
-                    try:
-                        h, m, s = time_match.split(':')
-                        current_time = float(h) * 3600 + float(m) * 60 + float(s)
-                        progress = min(current_time / duration, 1.0)
-                        if progress_callback:
-                            progress_callback(progress)
-                    except (ValueError, IndexError):
-                        pass
-                        
-                # Check for common error messages and log them
-                if "Error" in line or "Invalid" in line:
-                    log.error(f"FFmpeg error: {line.strip()}")
+            # Extract time progress
+            match = pattern.search(line)
+            if match and progress_callback:
+                time_str = match.group(1)
+                current_time = sum(float(x) * 60 ** i for i, x in enumerate(reversed(time_str.replace('.', ':').split(':'))))
+                progress = min(1.0, current_time / duration)
+                progress_callback(video_id, progress)
         
-        # Read any remaining output
-        remaining_stderr = process.stderr.read()
+        # Check process result
+        if process.returncode != 0:
+            log.error(f"FFmpeg failed with return code {process.returncode}")
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE videos 
+                SET status = 'error',
+                    error_message = ?
+                WHERE id = ?
+            """, (f'FFmpeg failed with return code {process.returncode}', video_id))
+            conn.commit()
+            return False
+            
+        # Verify output file exists and has non-zero size
+        if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
+            log.error(f"Output file {temp_path} is missing or empty")
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE videos 
+                SET status = 'error',
+                    error_message = ?
+                WHERE id = ?
+            """, ('Output file is missing or empty', video_id))
+            conn.commit()
+            return False
+            
+        # Compare sizes and check for bloat
+        original_size = os.path.getsize(video_path)
+        new_size = os.path.getsize(temp_path)
+        is_bloated = new_size > original_size
         
-        # Check for exit code only if we didn't terminate the process ourselves
-        if not ffmpeg_process_terminated:
-            process.wait()
-            
-            if process.returncode != 0:
-                log.error(f"FFmpeg error for {video_path} (exit code {process.returncode})")
-                return False
-        else:
-            return False
-            
-        # If exit was requested, don't proceed
-        if exit_requested:
-            return False
-            
-        # Get new file info
-        new_info = get_video_info(temp_path)
-        if not new_info:
-            return False
-            
         # Update database with results
         cursor = conn.cursor()
         cursor.execute("""
-        UPDATE videos 
-        SET new_size = ?, new_bitrate = ?, status = ?, date_completed = ? 
-        WHERE id = ?
-        """, (
-            new_info['size'],
-            new_info['bit_rate'],
-            'completed',
-            datetime.now(),
-            video_id
-        ))
+            UPDATE videos 
+            SET status = ?,
+                original_size = ?, 
+                new_size = ?,
+                is_bloated = ?,
+                date_completed = ?
+            WHERE id = ?
+        """, ('completed', original_size, new_size, is_bloated, datetime.now(), video_id))
         conn.commit()
+        
+        # Calculate size change percentage
+        change_pct = (new_size/original_size - 1) * 100
+        
+        # Log success with condensed size information
+        log.info(f"Successfully transcoded: {os.path.basename(video_path)} [{format_size(original_size)} → {format_size(new_size)} ({change_pct:.1f}%)]")
         
         return True
-    
-    except Exception as e:
-        log.exception(f"Transcoding error for {video_path}: {str(e)}")
         
-        # Update database with error
+    except Exception as e:
+        log.error(f"Error transcoding {video_path}: {str(e)}")
+        traceback.print_exc()
         cursor = conn.cursor()
         cursor.execute("""
-        UPDATE videos 
-        SET status = ?, error_message = ? 
-        WHERE id = ?
-        """, ('error', str(e), video_id))
+            UPDATE videos 
+            SET status = 'error',
+                error_message = ?
+            WHERE id = ?
+        """, (str(e), video_id))
         conn.commit()
-        
         return False
 
 def get_status_summary(conn):
@@ -971,6 +1193,10 @@ def process_videos(source_path, analyze_only=False, target_video=None):
         videos = find_videos(source_path)
         log.info(f"Found {len(videos)} video files")
         
+        # Initialize the rolodex with all video filenames (basename only) and their full paths
+        video_basenames = [os.path.basename(v) for v in videos]
+        ui.initialize_rolodex(video_basenames, source_files=videos)  # Pass both basenames and full paths
+        
         # Clean up database entries for missing files
         if source_path:
             cursor = conn.cursor()
@@ -1055,6 +1281,9 @@ def process_videos(source_path, analyze_only=False, target_video=None):
             directory = os.path.dirname(video_path)
             temp_path = os.path.join(directory, f"temp_{base_name}")
             
+            # Update the rolodex to show current file
+            ui.set_current_file(base_name)
+            
             current_temp_file = temp_path
             log.info(f"Processing: {base_name}")
             
@@ -1069,25 +1298,68 @@ def process_videos(source_path, analyze_only=False, target_video=None):
             # Stop progress tracking
             ui.stop_progress()
             
+            # Check if transcoding was successful
             if success and not exit_requested:
                 if os.path.exists(temp_path):
-                    if os.path.exists(video_path):
-                        os.remove(video_path)
-                        os.rename(temp_path, video_path)
-                        log.info(f"Successfully transcoded: {video_path}")
+                    # Get original and new file sizes
+                    orig_info = get_video_info(video_path)
+                    new_info = get_video_info(temp_path)
+                    
+                    if orig_info and new_info and 'size' in orig_info and 'size' in new_info:
+                        orig_size = orig_info['size']
+                        new_size = new_info['size']
+                        
+                        # Check if the new file is larger than the original
+                        if new_size > orig_size:
+                            # Mark as warning status in rolodex
+                            ui.set_file_status(base_name, 'warning')
+                            ui.update_file_size(base_name, new_size)
+                            
+                            # Rename temp file to bloated prefix
+                            bloated_name = f"bloated_{base_name}"
+                            bloated_path = os.path.join(directory, bloated_name)
+                            os.rename(temp_path, bloated_path)
+                            
+                            # Log warning
+                            log.warning(f"Transcoded file is larger than original: {base_name} "
+                                      f"(Original: {format_size(orig_size)}, New: {format_size(new_size)}). "
+                                      f"Keeping original and saving bloated version as {bloated_name}")
+                            
+                            # Update database
+                            cursor = conn.cursor()
+                            cursor.execute("""
+                            UPDATE videos 
+                            SET status = 'skipped', skip_reason = ?, new_size = ? 
+                            WHERE id = ?
+                            """, ('Transcoded file larger than original', new_size, video_id))
+                            conn.commit()
+                        else:
+                            # Normal success case - file is smaller
+                            if os.path.exists(video_path):
+                                os.remove(video_path)
+                                os.rename(temp_path, video_path)
+                                ui.set_file_status(base_name, True)
+                                ui.update_file_size(base_name, new_size)
+                                # Advance the rolodex after successful processing
+                                ui.advance_rolodex()
+                            else:
+                                log.error(f"Source file disappeared during transcoding: {video_path}")
+                                cursor = conn.cursor()
+                                cursor.execute("""
+                                UPDATE videos 
+                                SET status = 'error', error_message = ? 
+                                WHERE id = ?
+                                """, ('Source file disappeared during transcoding', video_id))
+                                conn.commit()
                     else:
-                        log.error(f"Source file disappeared during transcoding: {video_path}")
-                        cursor = conn.cursor()
-                        cursor.execute("""
-                        UPDATE videos 
-                        SET status = 'error', error_message = ? 
-                        WHERE id = ?
-                        """, ('Source file disappeared during transcoding', video_id))
-                        conn.commit()
+                        log.error(f"Failed to get file info for size comparison: {video_path}")
+                        if os.path.exists(temp_path):
+                            os.remove(temp_path)
                 else:
                     log.error(f"Temp file {temp_path} not found after transcoding")
             else:
                 log.error(f"Failed to transcode: {video_path}")
+                ui.set_file_status(base_name, False)
                 if os.path.exists(temp_path):
                     os.remove(temp_path)
             
