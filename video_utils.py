@@ -100,10 +100,14 @@ def eval_fraction(fraction_str: str) -> float:
     except (ValueError, ZeroDivisionError):
         return 0.0
 
-def run_sanity_checks(video_info: Dict[str, Any]) -> List[Dict[str, Any]]:
+def run_sanity_checks(video_info: Dict[str, Any], force_reconvert: bool = False) -> List[Dict[str, Any]]:
     """
     Run a series of sanity checks on a video file to identify potential issues.
     
+    Args:
+        video_info: Dictionary containing video metadata
+        force_reconvert: Whether to allow reconverting already processed files
+        
     Returns:
         List of issues detected, each as a dict with 'level', 'message', and 'details' keys.
         Empty list means no issues detected.
@@ -114,6 +118,19 @@ def run_sanity_checks(video_info: Dict[str, Any]) -> List[Dict[str, Any]]:
     if not video_info:
         return [{'level': 'error', 'message': 'Failed to extract video information', 'details': ''}]
     
+    # Check if already processed by our tool
+    if 'format' in video_info and 'tags' in video_info['format']:
+        tags = video_info['format']['tags']
+        if 'comment' in tags and tags['comment'].startswith('Processed by video_reconvert'):
+            level = 'error' if not force_reconvert else 'info'
+            issues.append({
+                'level': level,
+                'message': 'Video was already processed by video_reconvert',
+                'details': 'Use --force-reconvert to process again' if not force_reconvert else 'Forcing reconversion as requested'
+            })
+            if not force_reconvert:
+                return issues  # Stop checking if we won't process it anyway
+    
     # Check if file is actually a video
     if not video_info.get('video', {}).get('codec'):
         issues.append({
@@ -122,6 +139,17 @@ def run_sanity_checks(video_info: Dict[str, Any]) -> List[Dict[str, Any]]:
             'details': f"File: {video_info.get('filename')}"
         })
         return issues  # No point continuing checks
+    
+    # Check if already HEVC
+    if video_info['video'].get('codec') == 'hevc':
+        level = 'error' if not force_reconvert else 'info'
+        issues.append({
+            'level': level,
+            'message': 'Video is already encoded with HEVC codec',
+            'details': 'Use --force-reconvert to process again' if not force_reconvert else 'Re-encoding might not provide significant size reduction'
+        })
+        if not force_reconvert:
+            return issues  # Stop checking if we won't process it anyway
     
     # Check video resolution and dimensions
     width = video_info['video'].get('width', 0)
@@ -140,14 +168,6 @@ def run_sanity_checks(video_info: Dict[str, Any]) -> List[Dict[str, Any]]:
             'level': 'warning',
             'message': 'Video has odd dimensions which might cause issues with some encoders',
             'details': f"Width: {width}, Height: {height}"
-        })
-    
-    # Check if already HEVC (to avoid re-encoding with the same codec)
-    if video_info['video'].get('codec') == 'hevc':
-        issues.append({
-            'level': 'info',
-            'message': 'Video is already encoded with HEVC codec',
-            'details': 'Re-encoding might not provide significant size reduction'
         })
     
     # Check if already in target resolution or smaller

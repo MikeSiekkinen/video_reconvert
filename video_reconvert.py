@@ -83,7 +83,7 @@ def find_temp_files(source_path):
     temp_files = []
     for root, _, files in os.walk(source_path):
         for file in files:
-            if file.startswith(".temp_") and any(file.endswith(ext) for ext in config.FILE_SEARCH['extensions']):
+            if file.startswith("temp_") and any(file.endswith(ext) for ext in config.FILE_SEARCH['extensions']):
                 temp_files.append(os.path.join(root, file))
     return temp_files
 
@@ -282,15 +282,15 @@ def register_video(conn, video_path):
         log.info(f"Skipping already processed video: {video_path}")
         return None
     
-    # Run sanity checks
-    issues = video_utils.run_sanity_checks(info)
+    # Run sanity checks with force_reconvert flag
+    issues = video_utils.run_sanity_checks(info, config.VIDEO_ENCODING['force_reconvert'])
     
-    # Check if any critical issues would prevent processing
+    # Check for critical issues (error level)
     critical_issues = [issue for issue in issues if issue['level'] == 'error']
-    
     if critical_issues:
-        # Video has critical issues, mark as skipped
-        skip_reason = '; '.join([issue['message'] for issue in critical_issues])
+        skip_reason = critical_issues[0]['message']
+        if critical_issues[0].get('details'):
+            skip_reason += f" - {critical_issues[0]['details']}"
         cursor.execute("""
         INSERT INTO videos 
         (filepath, status, date_added, skip_reason) 
@@ -337,7 +337,6 @@ def transcode_video(video_path, temp_path, video_id, conn, progress_callback=Non
         # First, check if the source file exists
         if not os.path.exists(video_path):
             log.error(f"Source file does not exist: {video_path}")
-            # Update database
             cursor = conn.cursor()
             cursor.execute("""
             UPDATE videos 
@@ -347,6 +346,15 @@ def transcode_video(video_path, temp_path, video_id, conn, progress_callback=Non
             conn.commit()
             return False
             
+        # Ensure temp directory exists
+        temp_dir = os.path.dirname(temp_path)
+        if not os.path.exists(temp_dir):
+            try:
+                os.makedirs(temp_dir)
+            except OSError as e:
+                log.error(f"Failed to create temp directory {temp_dir}: {e}")
+                return False
+                
         # Get video info for this specific file
         info = get_video_info(video_path)
         if not info:
@@ -817,7 +825,7 @@ def process_videos(source_path, analyze_only=False, target_video=None):
             
         base_name = os.path.basename(video_path)
         directory = os.path.dirname(video_path)
-        temp_path = os.path.join(directory, f".temp_{base_name}")
+        temp_path = os.path.join(directory, f"temp_{base_name}")
         
         # Update global current_temp_file for signal handler
         current_temp_file = temp_path
