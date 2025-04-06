@@ -47,7 +47,7 @@ class VideoReconvertUI:
         
         # Split left panel into global stats and details
         self.layout["left_panel"].split_column(
-            Layout(name="global_stats", size=8),  # Fixed size for global stats
+            Layout(name="global_stats", size=10),  # Increased size to accommodate all rows including Space Saved
             Layout(name="details")  # Takes remaining space
         )
         
@@ -170,12 +170,30 @@ class VideoReconvertUI:
         """Update the log section with current messages"""
         # Format log messages with timestamp and level
         formatted_messages = []
+        last_timestamp = None
+        
+        # Calculate padding for timestamp (HH:MM:SS = 8 chars + 1 space)
+        timestamp_width = 8  # HH:MM:SS
+        level_width = 8      # For log level text
+        timestamp_padding = " " * (timestamp_width + 1)  # Space for "HH:MM:SS "
+        
         for msg in self.log_messages[-30:]:  # Show last 30 messages
             try:
                 # Extract timestamp and level if present
-                parts = msg.split(' - ', 3)
+                parts = msg.split(' - ')
                 if len(parts) >= 3:
-                    timestamp, logger, level, message = parts
+                    timestamp = parts[0]
+                    level = parts[2]
+                    # Join the rest of the parts back together as the message
+                    message = ' - '.join(parts[3:]) if len(parts) > 3 else ''
+                    
+                    # Convert timestamp to simpler format (HH:MM:SS)
+                    try:
+                        dt = datetime.strptime(timestamp, '%Y-%m-%d %H:%M:%S,%f')
+                        simple_timestamp = dt.strftime('%H:%M:%S')
+                    except ValueError:
+                        simple_timestamp = timestamp
+                        
                     level_style = {
                         'ERROR': config.UI['error_style'],
                         'WARNING': config.UI['warning_style'],
@@ -183,7 +201,13 @@ class VideoReconvertUI:
                         'DEBUG': 'dim white'
                     }.get(level, '')
                     
-                    formatted_msg = f"[dim]{timestamp}[/dim] [{level_style}]{level:8}[/{level_style}] {message}"
+                    # Only show timestamp if it's different from the last one
+                    if simple_timestamp != last_timestamp:
+                        formatted_msg = f"[dim]{simple_timestamp:>{timestamp_width}}[/dim] [{level_style}]{level:<{level_width}}[/{level_style}] {message}"
+                        last_timestamp = simple_timestamp
+                    else:
+                        formatted_msg = f"{timestamp_padding}[{level_style}]{level:<{level_width}}[/{level_style}] {message}"
+                    
                     formatted_messages.append(formatted_msg)
                 else:
                     formatted_messages.append(msg)
@@ -221,7 +245,8 @@ class UIRichHandler(RichHandler):
 
 # Configure logging
 log_level = getattr(logging, config.LOGGING['level'])
-log_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+log_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s', 
+                                datefmt='%Y-%m-%d %H:%M:%S')
 
 # File handler with rotation - set to DEBUG to capture all details
 file_handler = RotatingFileHandler(

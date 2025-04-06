@@ -1,9 +1,9 @@
 #!/bin/zsh
 
 # Default values
-MAX_FILES=3
-MAX_SIZE="300M"
-MIN_SIZE="100M"
+MAX_FILES=10
+MAX_SIZE="50M"
+MIN_SIZE="10M"
 SOURCE_PATH="/Volumes/docker/TubeArchivist/media"
 DEST_PATH="vids"
 RESET_DB=false
