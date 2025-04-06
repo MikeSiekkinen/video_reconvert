@@ -166,12 +166,14 @@ class VideoReconvertUI:
         # Keep track of log messages
         self.log_messages = []
         
-        # Progress bar for individual file progress
+        # Progress bar for individual file progress - don't start it yet
         self.progress = Progress(
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
             TaskProgressColumn(),
             TimeRemainingColumn(),
+            auto_refresh=False,  # Disable auto refresh since we're managing it
+            get_time=None,  # Use None to prevent progress creating its own timer
         )
         self.current_task = None
         
@@ -265,13 +267,13 @@ class VideoReconvertUI:
         """Start the live display"""
         self.live.start()
         self.update_header("Video Reconvert")
-        self.progress.start()
+        # Remove self.progress.start() - we don't want it to start independently
         
     def stop(self):
         """Stop the live display"""
         if self.current_task is not None:
             self.stop_progress()
-        self.progress.stop()
+        # Remove self.progress.stop() - we don't want to stop it independently
         self.live.stop()
         
     def update_header(self, text):
