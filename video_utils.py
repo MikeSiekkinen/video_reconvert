@@ -312,7 +312,7 @@ def analyze_conversion_potential(video_info: Dict[str, Any]) -> Dict[str, Any]:
     # Calculate scaling factor and new dimensions
     scale_factor = target_height / height if height > 0 else 1
     target_width = int(width * scale_factor / 2) * 2  # Ensure even width
-    target_height = int(height * scale_factor / 2) * 2  # Ensure even height
+    target_height = int(height * scale_factor / 2) * 2
     
     # Determine target bitrate for HEVC
     # HEVC typically requires ~50-60% bitrate of H.264 for same quality
@@ -342,9 +342,30 @@ def analyze_conversion_potential(video_info: Dict[str, Any]) -> Dict[str, Any]:
         # Complex content
         crf_value = 26
     
-    # Estimate size for HEVC encoding
-    estimated_size_crf = int(duration * target_bitrate * 0.125)  # Based on bitrate
-    estimated_saving_pct = (1 - (estimated_size_crf / original_size)) * 100 if original_size > 0 else 0
+    # Calculate more accurate size estimation
+    # HEVC typically achieves 40-50% better compression than H.264
+    hevc_compression_ratio = 0.6  # 40% better = 60% of original size
+    
+    # Calculate the quality factor impact
+    # q:v 35 is a moderate quality setting, should reduce size by ~30%
+    quality_factor = 0.7
+    
+    # Calculate resolution impact if we're downscaling
+    if target_width < width or target_height < height:
+        resolution_factor = (target_width * target_height) / (width * height)
+    else:
+        resolution_factor = 1.0
+    
+    # Calculate estimated size
+    estimated_size_bytes = int(
+        original_size *  # Start with original size
+        hevc_compression_ratio *  # HEVC compression benefit
+        quality_factor *  # Quality setting impact
+        resolution_factor  # Resolution change impact
+    )
+    
+    # Calculate savings percentage
+    estimated_saving_pct = (1 - (estimated_size_bytes / original_size)) * 100 if original_size > 0 else 0
     
     # Build recommendations
     analysis['recommendations'] = {
@@ -356,9 +377,9 @@ def analyze_conversion_potential(video_info: Dict[str, Any]) -> Dict[str, Any]:
     }
     
     analysis['estimated_savings'] = {
-        'estimated_size_mb': estimated_size_crf / (1024 * 1024),
+        'estimated_size_mb': estimated_size_bytes / (1024 * 1024),
         'estimated_saving_pct': estimated_saving_pct,
-        'estimated_saving_mb': (original_size - estimated_size_crf) / (1024 * 1024),
+        'estimated_saving_mb': (original_size - estimated_size_bytes) / (1024 * 1024),
     }
     
     return analysis
