@@ -232,18 +232,29 @@ class VideoReconvertUI:
             for full_path in source_files:
                 file_map[os.path.basename(full_path)] = full_path
         
-        # Initialize file sizes using full paths
+        # Initialize file sizes using just os.path.getsize() for speed
+        total_measured = 0
+        total_size = 0
         for file in files:
             try:
                 # Get the full path if available
                 full_path = file_map.get(file) if file_map else None
                 if full_path and os.path.exists(full_path):
-                    info = get_video_info(full_path)
-                    if info and 'size' in info:
-                        self.rolodex.set_file_size(file, info['size'])
+                    size = os.path.getsize(full_path)
+                    total_size += size
+                    self.rolodex.set_file_size(file, size)
+                    total_measured += 1
+                    
+                    # Log progress every 100 files
+                    if total_measured % 100 == 0:
+                        log.info(f"Measured {total_measured}/{len(files)} files ({format_size(total_size)} total)")
             except Exception as e:
                 log.debug(f"Failed to get size for {file}: {str(e)}")
                 pass  # Skip if we can't get size info
+        
+        # Log final count
+        if total_measured > 0:
+            log.info(f"Completed measuring {total_measured}/{len(files)} files ({format_size(total_size)} total)")
         
         # Force a refresh of the dashboard to show the rolodex
         if self.summary_table:
@@ -522,6 +533,10 @@ def setup_database():
     )
     ''')
     
+    # Create indexes for commonly queried fields
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_videos_status ON videos(status)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_videos_filepath ON videos(filepath)')
+    
     # Create schema version table if it doesn't exist
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS schema_version (
@@ -537,7 +552,7 @@ def setup_database():
     current_version = result[0] if result else 0
     
     # Current schema version
-    SCHEMA_VERSION = 2  # Increased version number
+    SCHEMA_VERSION = 2
     
     if current_version < SCHEMA_VERSION:
         log.info(f"Updating database schema from version {current_version} to {SCHEMA_VERSION}")
@@ -625,6 +640,7 @@ def register_video(conn, video_path):
     cursor = conn.cursor()
     
     # Check if video is already in database
+    log.debug(f"Checking if video exists in database: {video_path}")
     try:
         cursor.execute("SELECT id, status, skip_reason FROM videos WHERE filepath = ?", (video_path,))
         result = cursor.fetchone()
@@ -638,95 +654,31 @@ def register_video(conn, video_path):
     if result:
         video_id, status, skip_reason = result
         if status == 'completed':
-            log.info(f"Video already processed: {video_path}")
+            log.debug(f"Video already processed: {video_path}")
             return None
         elif status == 'skipped':
-            log.info(f"Video previously skipped: {video_path}. Reason: {skip_reason}")
+            log.debug(f"Video previously skipped: {video_path}. Reason: {skip_reason}")
             return None
         elif status == 'error' and not config.DATABASE['retry_errors']:
-            log.info(f"Skipping previously failed video: {video_path}")
+            log.debug(f"Skipping previously failed video: {video_path}")
             return None
         return video_id
     
-    # Get comprehensive video info
-    info = get_video_info(video_path)
-    if not info:
-        # Add to database as skipped due to info extraction failure
-        cursor.execute("""
-        INSERT INTO videos 
-        (filepath, status, date_added, skip_reason) 
-        VALUES (?, ?, ?, ?)
-        """, (
-            video_path, 
-            'skipped', 
-            datetime.now(),
-            'Failed to extract video information'
-        ))
-        conn.commit()
-        return None
-    
-    # Check if this file was already processed by our tool
-    if video_utils.was_processed_by_tool(info) and not config.VIDEO_ENCODING['force_reconvert']:
-        cursor.execute("""
-        INSERT INTO videos 
-        (filepath, status, date_added, skip_reason) 
-        VALUES (?, ?, ?, ?)
-        """, (
-            video_path, 
-            'skipped', 
-            datetime.now(),
-            'Already processed by video_reconvert'
-        ))
-        conn.commit()
-        log.info(f"Skipping already processed video: {video_path}")
-        return None
-    
-    # Run sanity checks with force_reconvert flag
-    issues = video_utils.run_sanity_checks(info, config.VIDEO_ENCODING['force_reconvert'])
-    
-    # Check for critical issues (error level)
-    critical_issues = [issue for issue in issues if issue['level'] == 'error']
-    if critical_issues:
-        skip_reason = critical_issues[0]['message']
-        if critical_issues[0].get('details'):
-            skip_reason += f" - {critical_issues[0]['details']}"
-        cursor.execute("""
-        INSERT INTO videos 
-        (filepath, status, date_added, skip_reason) 
-        VALUES (?, ?, ?, ?)
-        """, (
-            video_path, 
-            'skipped', 
-            datetime.now(),
-            skip_reason
-        ))
-        conn.commit()
-        log.warning(f"Skipping video due to critical issues: {video_path}. Reason: {skip_reason}")
-        return None
-    
-    # Get optimal encoding settings based on video analysis
-    optimal_settings = video_utils.get_optimal_encoding_settings(info)
-    
-    # Add to database with all metadata
+    # Add to database as pending first
+    log.debug(f"Registering new video in database: {video_path}")
     cursor.execute("""
     INSERT INTO videos 
-    (filepath, original_size, status, date_added, original_duration, 
-     original_width, original_height, original_bitrate, custom_settings) 
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    (filepath, status, date_added) 
+    VALUES (?, ?, ?)
     """, (
         video_path, 
-        info['size'], 
         'pending', 
-        datetime.now(),
-        info['duration'],
-        info['video']['width'],
-        info['video']['height'],
-        info['bit_rate'],
-        json.dumps(optimal_settings) if optimal_settings else None
+        datetime.now()
     ))
-    
+    video_id = cursor.lastrowid
     conn.commit()
-    return cursor.lastrowid
+    
+    return video_id
 
 def calculate_target_resolution(width, height):
     """Calculate target resolution maintaining aspect ratio."""
@@ -986,6 +938,10 @@ def transcode_video(video_path, temp_path, video_id, conn, progress_callback=Non
         new_size = os.path.getsize(temp_path)
         is_bloated = new_size > original_size
         
+        # Get new video info to extract bitrate
+        new_info = get_video_info(temp_path)
+        new_bitrate = new_info['bit_rate'] if new_info else None
+        
         # Update database with results
         cursor = conn.cursor()
         cursor.execute("""
@@ -993,10 +949,11 @@ def transcode_video(video_path, temp_path, video_id, conn, progress_callback=Non
             SET status = ?,
                 original_size = ?, 
                 new_size = ?,
+                new_bitrate = ?,
                 is_bloated = ?,
                 date_completed = ?
             WHERE id = ?
-        """, ('completed', original_size, new_size, is_bloated, datetime.now(), video_id))
+        """, ('completed', original_size, new_size, new_bitrate, is_bloated, datetime.now(), video_id))
         conn.commit()
         
         # Calculate size change percentage
@@ -1198,6 +1155,79 @@ def analyze_video(video_path):
     # Update dashboard with all tables
     ui.update_dashboard(Group(*tables))
 
+def update_video_metadata(conn, video_id, video_path):
+    """Update video metadata in the database after analysis."""
+    cursor = conn.cursor()
+    
+    # Get comprehensive video info
+    info = get_video_info(video_path)
+    if not info:
+        # Update as skipped due to info extraction failure
+        cursor.execute("""
+        UPDATE videos 
+        SET status = 'skipped',
+            skip_reason = ?
+        WHERE id = ?
+        """, ('Failed to extract video information', video_id))
+        conn.commit()
+        return False
+    
+    # Check if this file was already processed by our tool
+    if video_utils.was_processed_by_tool(info) and not config.VIDEO_ENCODING['force_reconvert']:
+        cursor.execute("""
+        UPDATE videos 
+        SET status = 'skipped',
+            skip_reason = ?
+        WHERE id = ?
+        """, ('Already processed by video_reconvert', video_id))
+        conn.commit()
+        log.info(f"Skipping already processed video: {video_path}")
+        return False
+    
+    # Run sanity checks with force_reconvert flag
+    issues = video_utils.run_sanity_checks(info, config.VIDEO_ENCODING['force_reconvert'])
+    
+    # Check for critical issues (error level)
+    critical_issues = [issue for issue in issues if issue['level'] == 'error']
+    if critical_issues:
+        skip_reason = critical_issues[0]['message']
+        if critical_issues[0].get('details'):
+            skip_reason += f" - {critical_issues[0]['details']}"
+        cursor.execute("""
+        UPDATE videos 
+        SET status = 'skipped',
+            skip_reason = ?
+        WHERE id = ?
+        """, (skip_reason, video_id))
+        conn.commit()
+        log.warning(f"Skipping video due to critical issues: {video_path}. Reason: {skip_reason}")
+        return False
+    
+    # Get optimal encoding settings based on video analysis
+    optimal_settings = video_utils.get_optimal_encoding_settings(info)
+    
+    # Update database with metadata
+    cursor.execute("""
+    UPDATE videos 
+    SET original_size = ?,
+        original_duration = ?,
+        original_width = ?,
+        original_height = ?,
+        original_bitrate = ?,
+        custom_settings = ?
+    WHERE id = ?
+    """, (
+        info['size'],
+        info['duration'],
+        info['video']['width'],
+        info['video']['height'],
+        info['bit_rate'],
+        json.dumps(optimal_settings) if optimal_settings else None,
+        video_id
+    ))
+    conn.commit()
+    return True
+
 def process_videos(source_path, analyze_only=False, target_video=None):
     """Main function to process all videos."""
     global current_temp_file
@@ -1248,13 +1278,17 @@ def process_videos(source_path, analyze_only=False, target_video=None):
         
         # Clean up database entries for missing files
         if source_path:
+            log.debug("Starting cleanup of database entries for missing files")
             cursor = conn.cursor()
             cursor.execute("SELECT id, filepath FROM videos WHERE status NOT IN ('completed', 'skipped')")
             db_files = cursor.fetchall()
+            log.debug(f"Found {len(db_files)} files to check for existence")
             
             missing_count = 0
             for file_id, filepath in db_files:
+                log.debug(f"Checking if file exists: {filepath}")
                 if not os.path.exists(filepath):
+                    log.debug(f"File does not exist, marking as skipped: {filepath}")
                     cursor.execute("""
                     UPDATE videos 
                     SET status = 'skipped', skip_reason = ? 
@@ -1264,14 +1298,23 @@ def process_videos(source_path, analyze_only=False, target_video=None):
                     log.warning(f"File in database no longer exists: {filepath}")
             
             if missing_count > 0:
+                log.debug(f"Committing changes for {missing_count} missing files")
                 conn.commit()
                 log.warning(f"Marked {missing_count} files as missing because they no longer exist on disk.")
         
         # Register all videos in database
+        log.debug(f"Starting registration of {len(videos)} videos")
+        registration_count = 0
         for video_path in videos:
+            log.debug(f"Registering video {registration_count + 1}/{len(videos)}: {video_path}")
             register_video(conn, video_path)
+            registration_count += 1
+            if registration_count % 100 == 0:
+                log.debug(f"Registered {registration_count}/{len(videos)} videos")
+        log.debug("Completed video registration")
         
         # Display initial status
+        log.debug("Gathering statistics for initial status display")
         display_status(conn)
         
         # If analyze_only mode, don't proceed with transcoding
@@ -1280,6 +1323,7 @@ def process_videos(source_path, analyze_only=False, target_video=None):
             return
         
         # Process videos that haven't been completed
+        log.debug("Querying for pending videos")
         cursor = conn.cursor()
         where_clause = "status = 'pending'"
         if config.DATABASE['retry_errors']:
@@ -1287,13 +1331,20 @@ def process_videos(source_path, analyze_only=False, target_video=None):
         
         cursor.execute(f"SELECT id, filepath FROM videos WHERE {where_clause}")
         pending_videos = cursor.fetchall()
+        log.debug(f"Found {len(pending_videos)} pending videos to process")
         
         # Filter out files that no longer exist
+        log.debug("Filtering out non-existent files from pending videos")
         valid_pending_videos = []
         for video_id, video_path in pending_videos:
+            log.debug(f"Checking if pending video exists: {video_path}")
             if os.path.exists(video_path):
-                valid_pending_videos.append((video_id, video_path))
+                # Update metadata and check if we should process this video
+                log.debug(f"Updating metadata for: {video_path}")
+                if update_video_metadata(conn, video_id, video_path):
+                    valid_pending_videos.append((video_id, video_path))
             else:
+                log.debug(f"Pending video no longer exists, marking as skipped: {video_path}")
                 cursor.execute("""
                 UPDATE videos 
                 SET status = 'skipped', skip_reason = ? 
@@ -1301,6 +1352,7 @@ def process_videos(source_path, analyze_only=False, target_video=None):
                 """, ('File no longer exists on disk', video_id))
                 log.warning(f"Skipping missing file: {video_path}")
         
+        log.debug("Committing changes after filtering pending videos")
         conn.commit()
         pending_videos = valid_pending_videos
         
