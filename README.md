@@ -2,6 +2,8 @@
 
 A command-line tool for transcoding video files to save disk space while maintaining decent quality.
 
+![Dashboard screenshot](images/video_reconvert_screenshot.png)
+
 ## Features
 
 - Finds and transcodes all MP4 files in a source directory
