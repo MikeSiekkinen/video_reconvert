@@ -2,7 +2,7 @@
 
 A command-line tool for transcoding video files to save disk space while maintaining decent quality.
 
-![Dashboard screenshot](images/video_reconvert_screenshot.png)
+![Dashboard screenshot](images/video_recoder_screenshot.png)
 
 ## Features
 
