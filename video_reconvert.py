@@ -812,18 +812,29 @@ def get_optimal_encoding_settings(video_info: Dict[str, Any]) -> Dict[str, Any]:
     if not video_info or 'video' not in video_info:
         return {}
     
-    # Calculate target resolution
+    # Calculate target resolution - always scale 4K down to 1080p max
+    is_4k = video_info['video']['width'] >= 3840 or video_info['video']['height'] >= 2160
     target_width, target_height = calculate_target_resolution(
         video_info['video']['width'],
         video_info['video']['height']
     )
     
-    # Calculate target bitrate
+    if is_4k:
+        log.info(f"Downscaling 4K video to 1080p for improved compression efficiency")
+    
+    # Calculate target bitrate - more aggressive compression
     target_bitrate = calculate_target_bitrate(video_info)
     
-    # Start with base settings
+    # For VP9/AV1 sources, use more aggressive bitrate reduction
+    if video_info['video'].get('codec') in ['vp9', 'av1']:
+        original_bitrate = video_info.get('bit_rate', 0)
+        # Use only 70% of calculated target, but never more than 75% of original
+        target_bitrate = min(int(target_bitrate * 0.7), int(original_bitrate * 0.75))
+        log.info(f"Source uses efficient {video_info['video'].get('codec')} codec; using aggressive bitrate target: {target_bitrate/1000000:.2f} Mbps")
+    
+    # Start with base settings using codec from config
     settings = {
-        'codec': 'hevc_videotoolbox',  # Using hardware encoding for speed
+        'codec': config.VIDEO_ENCODING['codec'],  # Use config setting instead of hardcoded value
         'extra_params': []
     }
     
@@ -836,74 +847,210 @@ def get_optimal_encoding_settings(video_info: Dict[str, Any]) -> Dict[str, Any]:
     
     # Set audio bitrate (scale with video bitrate but cap at 128k)
     audio_bitrate = min(int(target_bitrate * 0.05 / 1000), 128)
+    # For very long videos, consider even lower audio bitrate
+    if video_info.get('duration', 0) > 1800:  # 30 minutes
+        audio_bitrate = min(audio_bitrate, 96)  # Cap at 96k for long videos
     settings['audio_bitrate'] = f"{audio_bitrate}k"
     
-    # Add quality settings for hardware encoder
-    settings['extra_params'].extend([
-        '-q:v', '35',  # Quality setting for videotoolbox (higher number = lower quality/size)
-        '-b:v', f'{target_bitrate}',  # Target video bitrate
-        '-maxrate', f'{target_bitrate}',  # Maximum bitrate
-        '-bufsize', f'{target_bitrate * 2}',  # Buffer size (2x target for flexibility)
-        '-tag:v', 'hvc1'  # Better compatibility
-    ])
+    # Different settings based on codec
+    if settings['codec'] == 'libvpx-vp9':
+        # VP9 doesn't support two-pass encoding within a single command
+        # We'll use the modified two-pass approach in the transcode_video function
+        
+        # Optimal VP9 settings for maximum compression
+        settings['extra_params'].extend([
+            '-deadline', 'good',  # Balance between quality and speed
+            '-cpu-used', '2',     # CPU usage (0-5, lower is slower but better quality)
+            '-row-mt', '1',       # Multi-threaded encoding
+            '-crf', '32',         # Constant quality (0-63, higher = lower quality)
+            '-b:v', f'{target_bitrate}',  # Target video bitrate
+            '-maxrate', f'{target_bitrate * 1.5}',  # Allow some flexibility
+            '-minrate', f'{target_bitrate * 0.5}',  # Minimum bitrate
+            '-bufsize', f'{target_bitrate * 2}',    # Buffer size
+            '-tile-columns', '2',  # Parallel decoding
+            '-auto-alt-ref', '1',  # Use alternate reference frames
+            '-lag-in-frames', '25'  # Quality improvement for static scenes
+        ])
+        
+        # Set VP9-specific flags
+        settings['use_two_pass'] = True
+        settings['audio_codec'] = 'libopus'  # Better than AAC at low bitrates
+    elif settings['codec'] == 'hevc_videotoolbox':
+        # Settings for hardware HEVC encoder
+        settings['extra_params'].extend([
+            '-q:v', '35',  # Quality setting for videotoolbox (higher number = lower quality/size)
+            '-b:v', f'{target_bitrate}',  # Target video bitrate
+            '-maxrate', f'{target_bitrate}',  # Maximum bitrate
+            '-bufsize', f'{target_bitrate * 2}',  # Buffer size (2x target for flexibility)
+            '-tag:v', 'hvc1'  # Better compatibility
+        ])
     
     # Handle HDR content if present
     if (video_info['video'].get('color_transfer') in ['arib-std-b67', 'smpte2084', 'smpte2086'] or
         video_info['video'].get('color_primaries') in ['bt2020']):
-        settings['extra_params'].extend([
-            '-allow_sw', '1',
-            '-pix_fmt', 'p010le'
-        ])
+        
+        # For VP9, use different HDR settings
+        if settings['codec'] == 'libvpx-vp9':
+            settings['extra_params'].extend([
+                '-pix_fmt', 'yuv420p10le',  # 10-bit color
+                '-color_primaries', 'bt2020',
+                '-color_trc', video_info['video'].get('color_transfer', 'smpte2084'),
+                '-colorspace', 'bt2020nc'
+            ])
+        else:
+            # For HEVC
+            settings['extra_params'].extend([
+                '-allow_sw', '1',
+                '-pix_fmt', 'p010le'
+            ])
     
     return settings
 
 def transcode_video(video_path, temp_path, video_id, conn, progress_callback=None):
     """Transcode the video to save space while maintaining quality."""
     try:
-        # Get video info
-        info = get_video_info(video_path)
-        if not info:
-            log.error(f"Failed to get video info for {video_path}")
-            cursor = conn.cursor()
-            cursor.execute("""
-                UPDATE videos 
-                SET status = 'error',
-                    error_message = ?
-                WHERE id = ?
-            """, ('Failed to get video info', video_id))
-            conn.commit()
-            return False
+        # First check if we have metadata and settings stored in the database
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT original_size, original_duration, original_width, original_height, 
+                   original_bitrate, custom_settings
+            FROM videos
+            WHERE id = ? AND original_size IS NOT NULL AND custom_settings IS NOT NULL
+        """, (video_id,))
+        result = cursor.fetchone()
         
-        # Get optimal encoding settings
-        settings = get_optimal_encoding_settings(info)
+        if result and result[5]:  # We have custom_settings
+            # Unpack the database results
+            original_size, duration, width, height, bitrate, custom_settings_json = result
+            
+            log.debug(f"Using stored metadata and encoding settings for {video_path}")
+            
+            # Create a minimal info dict with required fields
+            info = {
+                'size': original_size,
+                'duration': duration,
+                'bit_rate': bitrate,
+                'video': {
+                    'width': width,
+                    'height': height
+                }
+            }
+            
+            # Parse the stored encoding settings
+            try:
+                settings = json.loads(custom_settings_json)
+            except json.JSONDecodeError:
+                log.warning(f"Failed to parse stored encoding settings for {video_path}, will regenerate")
+                settings = None
+        else:
+            # No stored info, or incomplete info
+            log.debug(f"No stored metadata found for {video_path}, generating fresh")
+            info = None
+            settings = None
+        
+        # If we don't have info or settings from the database, get them the normal way
+        if not info:
+            info = get_video_info(video_path)
+            if not info:
+                log.error(f"Failed to get video info for {video_path}")
+                cursor = conn.cursor()
+                cursor.execute("""
+                    UPDATE videos 
+                    SET status = 'error',
+                        error_message = ?
+                    WHERE id = ?
+                """, ('Failed to get video info', video_id))
+                conn.commit()
+                return False
+        
         if not settings:
-            log.error(f"Failed to determine encoding settings for {video_path}")
-            cursor = conn.cursor()
-            cursor.execute("""
-                UPDATE videos 
-                SET status = 'error',
-                    error_message = ?
-                WHERE id = ?
-            """, ('Failed to determine encoding settings', video_id))
-            conn.commit()
-            return False
+            # Get optimal encoding settings
+            settings = get_optimal_encoding_settings(info)
+            if not settings:
+                log.error(f"Failed to determine encoding settings for {video_path}")
+                cursor = conn.cursor()
+                cursor.execute("""
+                    UPDATE videos 
+                    SET status = 'error',
+                        error_message = ?
+                    WHERE id = ?
+                """, ('Failed to determine encoding settings', video_id))
+                conn.commit()
+                return False
         
         # Create a temp directory for progress files if it doesn't exist
         temp_dir = os.path.join(os.path.dirname(video_path), '.video_reconvert_temp')
         os.makedirs(temp_dir, exist_ok=True)
         
-        # Prepare FFmpeg command
-        cmd = [
-            'ffmpeg',
-            '-i', video_path,
-            '-c:v', settings['codec'],
-            '-c:a', 'aac',
-            '-b:a', settings['audio_bitrate'],
-            '-progress', 'pipe:1'  # Write progress to stdout
-        ]
+        # Set up for two-pass encoding if needed
+        use_two_pass = settings.get('use_two_pass', False)
         
-        # Add all extra parameters
-        cmd.extend(settings['extra_params'])
+        if use_two_pass:
+            log.info(f"Using two-pass encoding for {os.path.basename(video_path)} to optimize quality at low bitrate")
+            
+            # Create temp directory for VP9 pass log files
+            temp_dir = os.path.dirname(temp_path)
+            passlog_path = os.path.join(temp_dir, f"ffmpeg2pass-{os.path.basename(video_path)}")
+            
+            # First pass command (analyze only, no output file)
+            first_pass_cmd = [
+                'ffmpeg',
+                '-y',  # Overwrite output file
+                '-i', video_path,
+                '-c:v', settings['codec'],
+                '-pass', '1',
+                '-passlogfile', passlog_path,
+                '-f', 'null'
+            ]
+            first_pass_cmd.extend(settings['extra_params'])
+            first_pass_cmd.append('/dev/null')  # Output to null for first pass
+            
+            # Execute first pass
+            log.debug(f"First pass command: {' '.join(first_pass_cmd)}")
+            try:
+                subprocess.run(first_pass_cmd, check=True, capture_output=True)
+                log.info(f"First pass encoding completed for {os.path.basename(video_path)}")
+            except subprocess.CalledProcessError as e:
+                log.error(f"First pass encoding failed: {e}")
+                log.error(f"Error output: {e.stderr.decode() if e.stderr else 'No error output'}")
+                # Update database with error
+                cursor = conn.cursor()
+                cursor.execute("""
+                    UPDATE videos 
+                    SET status = 'error',
+                        error_message = ?
+                    WHERE id = ?
+                """, (f"First pass encoding failed: {str(e)}", video_id))
+                conn.commit()
+                return False
+            
+            # Second pass command (actual encoding)
+            cmd = [
+                'ffmpeg',
+                '-i', video_path,
+                '-c:v', settings['codec'],
+                '-pass', '2',
+                '-passlogfile', passlog_path,
+                '-c:a', settings.get('audio_codec', 'aac'),
+                '-b:a', settings['audio_bitrate'],
+                '-progress', 'pipe:1'  # Write progress to stdout
+            ]
+            
+            # Add all extra parameters
+            cmd.extend(settings['extra_params'])
+        else:
+            # Standard one-pass encoding
+            cmd = [
+                'ffmpeg',
+                '-i', video_path,
+                '-c:v', settings['codec'],
+                '-c:a', settings.get('audio_codec', 'aac'),
+                '-b:a', settings['audio_bitrate'],
+                '-progress', 'pipe:1'  # Write progress to stdout
+            ]
+            
+            # Add all extra parameters
+            cmd.extend(settings['extra_params'])
         
         # Add metadata
         settings_str = json.dumps(settings)
@@ -1311,7 +1458,7 @@ def update_video_metadata(conn, video_id, video_path):
     conn.commit()
     return True
 
-def process_videos(source_path, analyze_only=False, target_video=None):
+def process_videos(source_path, analyze_only=False, target_video=None, process_pending_only=False):
     """Main function to process all videos."""
     global current_temp_file
     
@@ -1350,17 +1497,19 @@ def process_videos(source_path, analyze_only=False, target_video=None):
                 log.error(f"Error: Video file not found: {target_video}")
             return
         
-        # Find all videos in source path
-        log.info(f"Scanning for videos in {source_path}")
-        videos = find_videos(source_path)
-        log.info(f"Found {len(videos)} video files")
-        
-        # Initialize the rolodex with all video filenames (basename only) and their full paths
-        video_basenames = [os.path.basename(v) for v in videos]
-        ui.initialize_rolodex(video_basenames, source_files=videos)  # Pass both basenames and full paths
-        
-        # Clean up database entries for missing files
-        if source_path:
+        # If processing pending only, skip file scanning
+        videos = []
+        if not process_pending_only and source_path:
+            # Find all videos in source path
+            log.info(f"Scanning for videos in {source_path}")
+            videos = find_videos(source_path)
+            log.info(f"Found {len(videos)} video files")
+            
+            # Initialize the rolodex with all video filenames (basename only) and their full paths
+            video_basenames = [os.path.basename(v) for v in videos]
+            ui.initialize_rolodex(video_basenames, source_files=videos)  # Pass both basenames and full paths
+            
+            # Clean up database entries for missing files
             log.debug("Starting cleanup of database entries for missing files")
             cursor = conn.cursor()
             cursor.execute("SELECT id, filepath FROM videos WHERE status NOT IN ('completed', 'skipped')")
@@ -1384,11 +1533,13 @@ def process_videos(source_path, analyze_only=False, target_video=None):
                 log.debug(f"Committing changes for {missing_count} missing files")
                 conn.commit()
                 log.warning(f"Marked {missing_count} files as missing because they no longer exist on disk.")
-        
-        # Register all videos in database using batch operation
-        log.info(f"Starting batch registration of {len(videos)} videos")
-        registered_ids = register_videos_batch(conn, videos)
-        log.info(f"Completed batch registration of {len(videos)} videos, {len(registered_ids)} new entries")
+            
+            # Register all videos in database using batch operation
+            log.info(f"Starting batch registration of {len(videos)} videos")
+            registered_ids = register_videos_batch(conn, videos)
+            log.info(f"Completed batch registration of {len(videos)} videos, {len(registered_ids)} new entries")
+        elif process_pending_only:
+            log.info("Running in process-pending mode: skipping directory scanning, only processing existing database entries")
         
         # Display initial status
         log.debug("Gathering statistics for initial status display")
@@ -1410,23 +1561,63 @@ def process_videos(source_path, analyze_only=False, target_video=None):
         pending_videos = cursor.fetchall()
         log.debug(f"Found {len(pending_videos)} pending videos to process")
         
-        # Update metadata for all pending videos
-        # We'll only check file existence during the actual processing stage
-        # to avoid unnecessary I/O operations
-        log.info(f"Updating metadata for {len(pending_videos)} pending videos")
-        valid_pending_videos = []
-        meta_count = 0
-        for video_id, video_path in pending_videos:
-            log.debug(f"Updating metadata for: {video_path}")
-            if update_video_metadata(conn, video_id, video_path):
-                valid_pending_videos.append((video_id, video_path))
-            
-            # Add heartbeat logging for visibility during processing large datasets
-            meta_count += 1
-            if meta_count % 100 == 0:
-                log.info(f"Metadata update progress: {meta_count}/{len(pending_videos)} videos ({(meta_count/len(pending_videos)*100):.1f}%)")
+        # If in pending-only mode, initialize the rolodex with pending videos
+        if process_pending_only and pending_videos:
+            video_paths = [video_path for _, video_path in pending_videos]
+            video_basenames = [os.path.basename(v) for v in video_paths]
+            ui.initialize_rolodex(video_basenames, source_files=video_paths)
         
-        log.info(f"Metadata update complete: {meta_count} videos processed, {len(valid_pending_videos)} valid for conversion")
+        # Update metadata for all pending videos
+        # In pending-only mode with stored metadata, we'll skip the metadata update for efficiency
+        valid_pending_videos = []
+        
+        if not process_pending_only or not pending_videos:
+            # Standard mode: update metadata for all pending videos
+            log.info(f"Updating metadata for {len(pending_videos)} pending videos")
+            meta_count = 0
+            for video_id, video_path in pending_videos:
+                log.debug(f"Updating metadata for: {video_path}")
+                if update_video_metadata(conn, video_id, video_path):
+                    valid_pending_videos.append((video_id, video_path))
+                
+                # Add heartbeat logging for visibility during processing large datasets
+                meta_count += 1
+                if meta_count % 100 == 0:
+                    log.info(f"Metadata update progress: {meta_count}/{len(pending_videos)} videos ({(meta_count/len(pending_videos)*100):.1f}%)")
+            
+            log.info(f"Metadata update complete: {meta_count} videos processed, {len(valid_pending_videos)} valid for conversion")
+        else:
+            # Pending-only mode optimization: check for existing metadata
+            log.info("Checking for existing metadata in pending videos")
+            meta_count = 0
+            cursor = conn.cursor()
+            
+            for video_id, video_path in pending_videos:
+                # Check if we have sufficient metadata already
+                cursor.execute("""
+                    SELECT original_size, original_bitrate, custom_settings
+                    FROM videos
+                    WHERE id = ? AND original_size IS NOT NULL
+                """, (video_id,))
+                result = cursor.fetchone()
+                
+                if result and all(result) and os.path.exists(video_path):
+                    # We have good metadata and the file exists
+                    log.debug(f"Using existing metadata for: {video_path}")
+                    valid_pending_videos.append((video_id, video_path))
+                else:
+                    # Need to update metadata
+                    log.debug(f"Updating metadata for: {video_path}")
+                    if update_video_metadata(conn, video_id, video_path):
+                        valid_pending_videos.append((video_id, video_path))
+                
+                # Add heartbeat logging
+                meta_count += 1
+                if meta_count % 100 == 0:
+                    log.info(f"Metadata check progress: {meta_count}/{len(pending_videos)} videos ({(meta_count/len(pending_videos)*100):.1f}%)")
+            
+            log.info(f"Metadata check complete: {len(valid_pending_videos)} videos ready for conversion")
+        
         log.debug("Committing changes after updating video metadata")
         conn.commit()
         pending_videos = valid_pending_videos
@@ -1547,7 +1738,7 @@ def process_videos(source_path, analyze_only=False, target_video=None):
 def main():
     """Parse arguments and start the video processing."""
     parser = argparse.ArgumentParser(description='Transcode video files to save space.')
-    parser.add_argument('source_path', help='Path to search for video files')
+    parser.add_argument('source_path', nargs='?', help='Path to search for video files (optional if --process-pending is used)')
     parser.add_argument('--extensions', help='Comma-separated list of file extensions to process (default: .mp4)')
     parser.add_argument('--crf', type=int, help='Constant Rate Factor (0-51, lower is better quality)')
     parser.add_argument('--preset', help='Encoding preset (e.g., medium, slow, fast)')
@@ -1556,6 +1747,7 @@ def main():
     parser.add_argument('--analyze-only', action='store_true', help='Only analyze videos without transcoding')
     parser.add_argument('--analyze-video', help='Analyze a single video file without transcoding')
     parser.add_argument('--force-reconvert', action='store_true', help='Allow reconverting files that were already processed')
+    parser.add_argument('--process-pending', action='store_true', help='Process only videos already marked as pending in database')
     
     args = parser.parse_args()
     
@@ -1587,8 +1779,19 @@ def main():
     if args.analyze_video:
         process_videos(None, analyze_only=True, target_video=args.analyze_video)
         return
+    
+    # Process pending videos mode (no directory scanning)
+    if args.process_pending:
+        if args.source_path:
+            log.warning("Note: source_path is ignored when using --process-pending")
+        process_videos(None, analyze_only=args.analyze_only, process_pending_only=True)
+        return
         
     # Otherwise, process normal source path mode
+    if not args.source_path:
+        print("Error: source_path is required unless --process-pending is specified")
+        sys.exit(1)
+        
     source_path = os.path.abspath(args.source_path)
     if not os.path.exists(source_path):
         print(f"Error: Source path '{source_path}' does not exist")

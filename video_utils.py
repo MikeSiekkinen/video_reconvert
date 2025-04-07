@@ -141,7 +141,7 @@ def run_sanity_checks(video_info: Dict[str, Any], force_reconvert: bool = False)
         })
         return issues  # No point continuing checks
     
-    # Check if already HEVC
+    # Check for already optimized codecs
     if video_info['video'].get('codec') == 'hevc':
         level = 'error' if not force_reconvert else 'info'
         issues.append({
@@ -151,6 +151,14 @@ def run_sanity_checks(video_info: Dict[str, Any], force_reconvert: bool = False)
         })
         if not force_reconvert:
             return issues  # Stop checking if we won't process it anyway
+    
+    # Check for VP9 or AV1 codecs (which are often more efficient than HEVC)
+    if video_info['video'].get('codec') in ['vp9', 'av1']:
+        issues.append({
+            'level': 'warning',  # Warning, not error, so processing still occurs
+            'message': f"Video uses efficient {video_info['video'].get('codec')} codec",
+            'details': f"Using aggressive bitrate targeting to ensure size reduction"
+        })
     
     # Check video resolution and dimensions
     width = video_info['video'].get('width', 0)
