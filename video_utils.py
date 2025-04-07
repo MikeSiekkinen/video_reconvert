@@ -7,6 +7,7 @@ import os
 import json
 import subprocess
 import logging
+import config
 from typing import Dict, Any, Tuple, Optional, List
 
 # Get logger
@@ -381,7 +382,7 @@ def analyze_conversion_potential(video_info: Dict[str, Any]) -> Dict[str, Any]:
         'target_resolution': f"{target_width}x{target_height}",
         'target_bitrate_kbps': target_bitrate,
         'recommended_crf': crf_value,
-        'codec': 'libvpx-vp9',  # Always use VP9 codec from config
+        'codec': config.VIDEO_ENCODING['codec'],  # Use codec from config
         'audio_bitrate': min(video_info.get('audio', {}).get('bit_rate', 0) / 1000, 128) if video_info.get('audio') else 96,
     }
     
