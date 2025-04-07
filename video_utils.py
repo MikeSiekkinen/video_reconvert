@@ -381,7 +381,7 @@ def analyze_conversion_potential(video_info: Dict[str, Any]) -> Dict[str, Any]:
         'target_resolution': f"{target_width}x{target_height}",
         'target_bitrate_kbps': target_bitrate,
         'recommended_crf': crf_value,
-        'codec': 'hevc_videotoolbox' if video_info['video'].get('codec') != 'hevc' else 'copy',
+        'codec': 'libvpx-vp9',  # Always use VP9 codec from config
         'audio_bitrate': min(video_info.get('audio', {}).get('bit_rate', 0) / 1000, 128) if video_info.get('audio') else 96,
     }
     
@@ -430,8 +430,8 @@ def get_optimal_encoding_settings(video_info: Dict[str, Any]) -> Dict[str, Any]:
     
     if is_hdr:
         # HDR content needs special handling to preserve HDR metadata
-        if settings['codec'] == 'hevc_videotoolbox':
-            # VideoToolbox can preserve HDR, but needs special flags
+        if 'hevc' in settings['codec'] or 'videotoolbox' in settings['codec']:
+            # VideoToolbox handling for HDR
             settings['extra_params'].extend([
                 '-allow_sw', '1',
                 '-pix_fmt', 'p010le',  # 10-bit 4:2:0 format for HDR
@@ -440,7 +440,7 @@ def get_optimal_encoding_settings(video_info: Dict[str, Any]) -> Dict[str, Any]:
                 '-colorspace', 'bt2020nc'
             ])
         else:
-            # Software encoding needs to preserve HDR metadata
+            # Software encoding like VP9 needs different HDR metadata
             settings['extra_params'].extend([
                 '-pix_fmt', 'yuv420p10le',
                 '-color_primaries', 'bt2020',
